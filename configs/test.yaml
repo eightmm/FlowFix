@@ -1,0 +1,68 @@
+# Test config for quick validation without physics
+model:
+  protein_feat_dim: 72
+  ligand_feat_dim: 14
+  edge_dim: 32
+  hidden_scalars: 48
+  hidden_vectors: 16
+  hidden_dim: 128
+  out_dim: 256
+  num_layers: 6
+  max_ell: 2
+  cutoff: 10.0
+  time_embedding_dim: 64
+  dropout: 0.1
+
+data:
+  data_dir: "data/graph"
+  max_samples: 4          # Use 4 samples to test batching
+  max_samples_val: 2      # 2 validation samples
+  cache_data: false
+  num_workers: 0
+  seed: 42
+  train_perturbation_mode: "random"
+  val_perturbation_mode: "fixed"
+  resample_every_epoch: true
+  val_fixed_t: 0.5
+  
+  perturbation:
+    translation_std: 5.0  # Increased for more robust training
+    rotation_std: 1.5     # Increased for better generalization
+    torsion_std: 1.0      # Increased for diverse conformations
+    min_rmsd: 5.0         # Higher minimum perturbation
+    max_rmsd: 15.0        # Much larger maximum perturbation
+
+training:
+  batch_size: 2          # Test with batch size 2
+  num_epochs: 1          # Only 1 epoch for quick test
+  learning_rate: 0.0005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1  # No accumulation for test
+  save_every: 1
+  val_every: 1
+  checkpoint_dir: "checkpoints/test"
+  use_amp: false
+
+loss:
+  smooth_l1_beta: 1.0
+
+logging:
+  use_wandb: false
+  project: "flowfix-test"
+  run_name: "test_run"
+
+flow:
+  noise_schedule: "linear"
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+inference:
+  num_steps: 100
+  solver: "euler"
+
+optimization:
+  gradient_checkpointing: false
+  cpu_offload: false
+  find_unused_parameters: false

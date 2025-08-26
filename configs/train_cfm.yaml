@@ -1,0 +1,62 @@
+# Conditional Flow Matching (CFM) Model Configuration
+
+model:
+  protein_feat_dim: 72      # Protein residue features
+  ligand_feat_dim: 14       # Ligand atom features
+  edge_dim: 64              # Edge feature dimension
+  hidden_scalars: 128       # Scalar channels
+  hidden_vectors: 32        # Vector channels
+  hidden_dim: 256           # MLP hidden dimension
+  out_dim: 256              # Output dimension
+  num_layers: 8             # Number of equivariant layers
+  max_ell: 2                # Maximum angular momentum
+  cutoff: 10.0              # Distance cutoff (Angstroms)
+  time_embedding_dim: 128   # Time encoding dimension
+  dropout: 0.1
+  num_heads: 8              # Attention heads
+  use_layer_norm: true      # Use layer normalization
+  use_gate: true            # Use gating mechanism
+
+data:
+  data_dir: "data/graph"
+  max_samples: null         # null for all samples, set number for debugging
+  max_samples_val: 500      # Validation samples
+  cache_data: false         # Set to true for small datasets
+  seed: 42
+  
+  perturbation:
+    translation_std: 5.0    # Translation noise (Angstroms)
+    rotation_std: 1.5       # Rotation noise (radians)
+    torsion_std: 1.0        # Torsion angle noise
+    min_rmsd: 5.0           # Minimum perturbation RMSD
+    max_rmsd: 15.0          # Maximum perturbation RMSD
+
+training:
+  batch_size: 4             # Batch size per GPU
+  num_epochs: 300
+  learning_rate: 0.0001     # Initial learning rate
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4  # Effective batch = 4 * 4 = 16
+  save_every: 10
+  val_every: 2
+  checkpoint_dir: "checkpoints/cfm"
+
+loss:
+  sigma_min: 0.001          # Minimum noise level
+  use_ot: true              # Use optimal transport
+  lambda_reg: 0.01          # Regularization weight
+
+logging:
+  use_wandb: false
+  project: "flowfix-cfm"
+  run_name: "cfm_base"
+
+ema:
+  enabled: true
+  decay: 0.999
+
+# Inference settings
+inference:
+  num_steps: 50             # Number of integration steps
+  solver: "euler"           # ODE solver
