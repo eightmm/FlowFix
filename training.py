@@ -575,11 +575,13 @@ class FlowFixTrainer:
             # Training
             self.model.train()
             epoch_losses = []
+            epoch_rmsds = []
 
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
             for batch in pbar:
                 metrics = self.train_step(batch)
                 epoch_losses.append(metrics['loss'])
+                epoch_rmsds.append(metrics['rmsd'])
                 self.global_step += 1
 
                 pbar.set_postfix({
@@ -627,18 +629,24 @@ class FlowFixTrainer:
             # Print summary
             current_lr = self.optimizer.param_groups[0]['lr']
             avg_epoch_loss = np.mean(epoch_losses)
+            avg_epoch_rmsd = np.mean(epoch_rmsds)
             print(f"\nEpoch {epoch} Summary:")
             print(f"  📊 Train Loss: {avg_epoch_loss:.4f}")
+            print(f"  📏 Train RMSD: {avg_epoch_rmsd:.3f} Å")
             print(f"  📈 Learning Rate: {current_lr:.6f}")
             print(f"  ⏰ Early stopping: {self.early_stopper.counter}/{self.early_stopper.patience}")
-            
-            # Log epoch summary to WandB (early stopping counter)
+
+            # Log epoch summary to WandB
             if self.wandb_enabled:
                 self.wandb_logger.log({
-                    'system/early_stopping_counter': self.early_stopper.counter,
-                    'system/early_stopping_patience': self.early_stopper.patience,
-                    'system/epoch': epoch,
-                    'system/step': self.global_step
+                    # Training epoch averages
+                    'train/epoch_loss': avg_epoch_loss,
+                    'train/epoch_rmsd': avg_epoch_rmsd,
+                    # System info
+                    'meta/early_stopping_counter': self.early_stopper.counter,
+                    'meta/early_stopping_patience': self.early_stopper.patience,
+                    'meta/epoch': epoch,
+                    'meta/step': self.global_step
                 })
 
             # Scheduler step (epoch-based)
