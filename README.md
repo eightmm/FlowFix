@@ -1,144 +1,105 @@
-# FlowFix: Flow Matching for Protein-Ligand Binding Pose Refinement
+# FlowFix: SE(3)-Equivariant Flow Matching for Protein-Ligand Pose Refinement
+
+FlowFix refines perturbed protein-ligand binding poses back to crystal structures using SE(3)-equivariant flow matching.
 
 ## Overview
-FlowFix implements SE(3)-equivariant flow matching models for refining protein-ligand binding poses to achieve crystal-like accuracy.
 
-## Models
+- **Goal**: Refine docked protein-ligand poses to high-accuracy crystal structures
+- **Method**: SE(3)-equivariant flow matching with cuequivariance
+- **Architecture**: Protein-Ligand interaction network with atomwise velocity prediction
 
-### 1. FlowFixEquivariantModel (`models/flowfix_equivariant.py`)
-- Original SE(3)-equivariant model using cuEquivariance
-- Stable and tested implementation
-- Recommended for initial experiments
+## Installation
 
-### 2. ConditionalFlowMatching (`models/flowfix_cfm.py`)
-- Advanced conditional flow matching with optimal transport
-- Enhanced features: learnable Fourier time encoding, gating, multi-scale processing
-- Higher capacity model for better performance
+### Environment Setup
 
-## Quick Start
-
-### Installation
 ```bash
-# Ensure cuEquivariance is installed
-pip install cuequivariance-torch
+# Create conda environment
+conda create -n protein-ligand python=3.11
+conda activate protein-ligand
+
+# Install PyTorch with CUDA support
+conda install pytorch torchvision pytorch-cuda=12.8 -c pytorch -c nvidia
+
+# Install PyTorch Geometric
+pip install torch-geometric torch-cluster torch-scatter torch-sparse
+
+# Install cuequivariance
+pip install cuequivariance cuequivariance-torch
+
+# Install other dependencies
+pip install -r requirements.txt
 ```
 
-### Data Preparation
-```bash
-# Process PDBbind dataset
-python scripts/prepare_data.py \
-    --data_dir /path/to/PDBbind \
-    --output_dir data/graph \
-    --max_samples 100  # For testing
+## Project Structure
+
 ```
-
-### Training
-
-#### Option 1: Train Original Model
-```bash
-python train.py --config configs/train.yaml
-```
-
-#### Option 2: Train CFM Model (Advanced)
-```bash
-python train_cfm.py --config configs/train_cfm.yaml
-```
-
-### Testing
-```bash
-# Test both models
-python test_models.py
-
-# Test training functionality
-python test_train.py
-```
-
-## Configuration
-
-### Key Parameters (`configs/train.yaml` or `configs/train_cfm.yaml`)
-
-```yaml
-model:
-  num_layers: 6-8        # Number of equivariant layers
-  cutoff: 10.0           # Distance cutoff in Angstroms
-  hidden_scalars: 48-128 # Scalar feature channels
-  hidden_vectors: 16-32  # Vector feature channels
-
-training:
-  batch_size: 4-8
-  learning_rate: 0.0001-0.0005
-  num_epochs: 200-300
-
-data:
-  perturbation:
-    translation_std: 5.0  # Translation noise (Å)
-    rotation_std: 1.5     # Rotation noise (radians)
-    min_rmsd: 5.0         # Minimum perturbation
-    max_rmsd: 15.0        # Maximum perturbation
-```
-
-## Model Features
-
-### SE(3) Equivariance
-- Rotation and translation equivariant processing
-- Preserves geometric symmetries
-- Tested with equivariance checks
-
-### Flow Matching
-- Learns transformation from perturbed to crystal poses
-- Time-conditioned vector field prediction
-- Smooth trajectory generation
-
-### Architecture
-- **Input**: Protein residue features + Ligand atom features
-- **Processing**: SE(3)-equivariant message passing
-- **Output**: Vector field for ligand refinement
-
-## File Structure
-```
-FlowFix/
-├── models/
-│   ├── flowfix_equivariant.py  # Original model
-│   └── flowfix_cfm.py           # CFM model
-├── train.py                     # Training script (original)
-├── train_cfm.py                 # Training script (CFM)
+flowfix/
+├── src/
+│   ├── data/
+│   │   ├── dataset.py          # FlowFixDataset with new ligand format
+│   │   └── feat.py             # Feature extraction utilities
+│   ├── models/
+│   │   ├── flowmatching.py     # Main flow matching model
+│   │   ├── network.py          # Equivariant networks
+│   │   ├── cue_layers.py       # Cuequivariance layers
+│   │   └── torch_layers.py     # Standard PyTorch layers
+│   └── utils/
+│       ├── training_utils.py   # Training helpers
+│       ├── experiment.py       # Experiment management
+│       └── ...                 # Other utilities
 ├── configs/
-│   ├── train.yaml               # Config for original model
-│   └── train_cfm.yaml           # Config for CFM model
-├── data/
-│   ├── dataset.py               # PyTorch dataset
-│   └── batch_dataset.py        # Batched collation
-└── utils/
-    ├── ema.py                   # Exponential moving average
-    └── initialization.py        # Weight initialization
+│   └── train.yaml              # Training configuration
+├── tests/
+│   └── train_overfit.py        # Overfitting test
+├── training.py                 # Main training script
+└── requirements.txt            # Python dependencies
 ```
 
-## Performance Tips
+## Data Format
 
-1. **Start with smaller models**: Use fewer layers (2-4) for initial experiments
-2. **Gradient accumulation**: Increase effective batch size without memory issues
-3. **EMA**: Use exponential moving average for stable inference
-4. **Mixed precision**: Enable for faster training (if supported)
+### Ligand Data (ligands.pt)
+List of 60 docked poses per PDB, each containing:
+- `edges`: [2, E] edge indices
+- `node_feats`: [N, 122] atom features
+- `edge_feats`: [E, 44] edge features
+- `coord`: [N, 3] docked pose coordinates (x₀)
+- `crystal_coord`: [N, 3] crystal structure coordinates (x₁)
+- `distance_lower_bounds`: [N, N] distance constraints
+- `distance_upper_bounds`: [N, N] distance constraints
 
-## Common Issues
+### Protein Data (protein.pt)
+- `node['coord']`: Residue coordinates
+- `node['node_scalar_features']`: Residue scalar features
+- `node['node_vector_features']`: Residue vector features (31 x 3D vectors)
+- `edge['edges']`: Edge indices
+- `edge['edge_scalar_features']`: Edge scalar features
+- `edge['edge_vector_features']`: Edge vector features (8 x 3D vectors)
 
-### Out of Memory
-- Reduce `batch_size` in config
-- Reduce `num_layers` or `hidden_scalars/vectors`
-- Enable gradient accumulation
+## Training
 
-### No Edges Found
-- Increase `cutoff` distance
-- Check data preprocessing
-- Ensure protein and ligand are close enough
+```bash
+# Train model
+python training.py --config configs/train.yaml
 
-### Zero Gradients
-- Model is initialized and working
-- Check learning rate (not too small)
-- Verify data is loaded correctly
+# Overfit test
+python tests/train_overfit.py
+```
 
-## Citation
-This implementation uses the cuEquivariance library for SE(3)-equivariant operations.
+## Key Features
+
+- **Memory-efficient**: Samples one pose per PDB per epoch
+- **SE(3) Equivariant**: Preserves rotation and translation symmetries
+- **Pocket Extraction**: 12Å cutoff for binding site residues
+- **Vector Features**: Utilizes directional protein features (31 node + 8 edge vectors)
+- **Flow Matching**: Linear interpolation from docked to crystal pose
+
+## Model Architecture
+
+1. **Protein Network**: Encodes fixed protein structure with vector features
+2. **Ligand Network**: Encodes ligand at current time t
+3. **Interaction Network**: Protein-ligand cross-attention
+4. **Velocity Predictor**: Atomwise velocity field for pose refinement
 
 ## License
-MIT
+
+MIT License

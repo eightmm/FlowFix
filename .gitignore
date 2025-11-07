@@ -39,13 +39,18 @@ checkpoints/
 runs/
 logs/
 wandb/
+save/
 
 # Data
 data/graph/
 data/raw/
+train_data/
+train_data_dg/
 *.pdb
 *.sdf
 *.mol2
+*.tgz
+*.tar.gz
 
 # IDE
 .vscode/
@@ -65,3 +70,11 @@ temp/
 *.tmp
 *.bak
 *.cache
+
+# Project specific
+docs/
+scripts/
+.cursorignore
+.kiro/
+FLOWFIX_GUIDE.md
+python.env

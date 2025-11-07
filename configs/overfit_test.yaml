@@ -1,0 +1,116 @@
+# FlowFix Overfitting Test Configuration
+# Based on successful model: flowfix_20251104_151853
+# Uses ONLY simple flow matching loss (no auxiliary losses)
+
+device: cuda
+seed: 42
+
+# Data - Small dataset for overfitting test (Dynamic Pose Sampling)
+data:
+  data_dir: train_data    # ✅ Relative path to current directory
+  split_file: null
+  max_train_samples: 50   # Small dataset for overfitting test
+  max_val_samples: 5      # Validation samples
+  num_workers: 4
+  # Note: Each epoch samples different poses per PDB for augmentation
+
+# Model dimensions (same as successful model)
+model:
+  # Protein network
+  protein_input_scalar_dim: 76
+  protein_input_vector_dim: 31
+  protein_input_edge_scalar_dim: 39
+  protein_input_edge_vector_dim: 8
+  protein_hidden_scalar_dim: 64
+  protein_hidden_vector_dim: 16
+  protein_output_scalar_dim: 64
+  protein_output_vector_dim: 16
+  protein_num_layers: 4
+
+  # Ligand network
+  ligand_input_scalar_dim: 122
+  ligand_input_edge_scalar_dim: 44
+  ligand_hidden_scalar_dim: 64
+  ligand_hidden_vector_dim: 16
+  ligand_output_scalar_dim: 64
+  ligand_output_vector_dim: 16
+  ligand_num_layers: 4
+
+  # Interaction network (CRITICAL: 4 layers, not 8!)
+  interaction_hidden_dim: 256
+  interaction_num_heads: 8
+  interaction_num_rbf: 32  # Rich distance encoding
+  interaction_pair_dim: 64  # Expressive pair bias
+  interaction_num_layers: 4  # ✅ Matches successful model (13M params)
+
+  # Velocity predictor
+  velocity_hidden_scalar_dim: 64
+  velocity_hidden_vector_dim: 16
+  velocity_num_layers: 4
+
+  # Regularization
+  dropout: 0.1  # ✅ Enable dropout
+
+# Training - Settings from successful model
+training:
+  num_epochs: 500
+  batch_size: 2
+  num_timesteps_per_sample: 16  # Sample 16 timesteps per system
+  val_batch_size: 8
+  learning_rate: 0.001  # 1e-3 for fast convergence on small data
+  gradient_clip: 100.0
+
+  optimizer:
+    type: adam
+    weight_decay: 0.0  # No regularization for overfitting
+    betas: [0.9, 0.999]
+    eps: 1.0e-08
+
+  scheduler:
+    # CosineAnnealingWarmRestarts
+    eta_max: 0.01
+    T_0: 10      # Restart every 10 epochs
+    T_mult: 1    # Same period
+    T_up: 2      # Warmup for 2 epochs
+    gamma: 0.95  # Decay by 5% each restart
+
+  validation:
+    frequency: 150  # ✅ Validate every 10 epochs
+    save_best: true
+    early_stopping_patience: 100
+
+# Sampling (for validation)
+sampling:
+  num_steps: 50
+  method: euler
+
+# Experiment management
+experiment:
+  base_dir: save
+
+# Checkpoints
+checkpoint:
+  save_freq: 10
+  save_latest: true
+  keep_last_n: 10
+
+# Visualization
+visualization:
+  enabled: true
+  save_animation: true
+  animation_fps: 10
+  num_samples: 1
+
+# WandB logging
+wandb:
+  enabled: true
+  project: "protein-ligand-flowfix-overfit"
+  entity: null
+  name: null  # Auto-generated
+  tags: ["overfit-test", "simple-flow-matching", "5-samples"]
+  log_gradients: true
+  log_model_weights: true
+  log_animations: true
+  log_parameter_histograms: true
+  log_parameter_evolution: true
+  log_layer_analysis: true

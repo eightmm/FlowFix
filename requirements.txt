@@ -1,0 +1,30 @@
+# FlowFix Requirements for protein-ligand environment
+
+# Core dependencies
+torch>=2.8.0
+numpy>=2.3.0
+pandas>=2.3.0
+scipy>=1.16.0
+pyyaml>=6.0
+
+# Geometric deep learning
+torch-geometric>=2.6.0
+torch-cluster>=1.6.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
+
+# Cuequivariance for SE(3)-equivariant networks
+cuequivariance>=0.7.0
+cuequivariance-torch>=0.7.0
+
+# Utilities
+tqdm>=4.67.0
+wandb>=0.22.0
+
+# Visualization
+matplotlib>=3.10.0
+seaborn>=0.13.0
+
+# Optional: Jupyter support
+# jupyter>=1.0.0
+# ipython>=8.0.0
