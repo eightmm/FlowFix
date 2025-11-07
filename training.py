@@ -22,9 +22,7 @@ from src.utils.experiment import ExperimentManager
 from src.utils.wandb_logger import (
     WandBLogger,
     extract_module_gradient_norms,
-    extract_gradient_stats_by_layer,
-    extract_parameter_histograms,
-    extract_parameter_stats_by_layer
+    extract_parameter_stats
 )
 
 
@@ -311,29 +309,18 @@ class FlowFixTrainer:
         with torch.no_grad():
             rmsd = torch.sqrt(torch.mean((x_t - replicated_ligand_coords_x1) ** 2))
 
-        # Log gradients if WandB is enabled
-        if self.wandb_enabled and self.config.get('wandb', {}).get('log_gradients', True):
-            # Extract and log gradient norms
-            total_norm, module_norms = extract_module_gradient_norms(self.model)
-            self.wandb_logger.log_gradient_norms(total_norm, module_norms, self.global_step)
+        # Log gradients and parameters if WandB is enabled
+        if self.wandb_enabled:
+            # Log gradient norms (every step)
+            if self.config.get('wandb', {}).get('log_gradients', True):
+                total_norm, module_norms = extract_module_gradient_norms(self.model)
+                self.wandb_logger.log_gradient_norms(total_norm, module_norms, self.global_step)
 
-            # Log detailed layer-wise gradient stats every 10 steps
-            if (self.global_step + 1) % 10 == 0:
-                layer_stats, layer_histograms = extract_gradient_stats_by_layer(self.model)
-                self.wandb_logger.log_gradient_stats_by_layer(layer_stats)
-                self.wandb_logger.log_gradient_histograms(layer_histograms)
-
-            # Log parameter stats and changes every 10 steps
-            if (self.global_step + 1) % 10 == 0:
-                layer_stats, self.param_history = extract_parameter_stats_by_layer(
-                    self.model, self.param_history
-                )
-                self.wandb_logger.log_parameter_stats_by_layer(layer_stats)
-
-            # Log parameter histograms every 50 steps
-            if (self.global_step + 1) % 50 == 0:
-                module_hists, layer_hists, type_hists = extract_parameter_histograms(self.model)
-                self.wandb_logger.log_parameter_histograms(module_hists, layer_hists, type_hists)
+            # Log parameter stats every 50 steps
+            if self.config.get('wandb', {}).get('log_model_weights', True):
+                if (self.global_step + 1) % 50 == 0:
+                    module_stats = extract_parameter_stats(self.model)
+                    self.wandb_logger.log_parameter_stats(module_stats)
 
         return {
             'loss': loss.item(),

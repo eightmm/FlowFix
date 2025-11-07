@@ -1,90 +1,113 @@
-# FlowFix Equivariant Model Training Configuration
+# FlowFix Full-Scale Training Configuration
+# Dataset: ~18,000 PDBs × 60 poses = ~1.1M training samples
 
-model:
-  protein_feat_dim: 72  # Dimension of protein scalar features (actual)
-  ligand_feat_dim: 14   # Dimension of ligand scalar features (actual)
-  edge_dim: 32          # Edge feature dimension
-  hidden_scalars: 48    # Number of scalar channels in hidden layers
-  hidden_vectors: 16    # Number of vector channels in hidden layers
-  hidden_dim: 128       # Hidden dimension for MLPs
-  out_dim: 256          # Output dimension
-  num_layers: 6         # Number of equivariant message passing layers
-  max_ell: 2            # Maximum angular momentum for spherical harmonics
-  cutoff: 10.0          # Distance cutoff in Angstroms
-  time_embedding_dim: 64
-  dropout: 0.1
+device: cuda
+seed: 42
 
+# Data - Full Dataset (Dynamic Pose Sampling)
 data:
-  data_dir: "data/graph"  # Directory with processed .pt files
-  max_samples: null       # Set to limit number of training samples (for debugging)
-  max_samples_val: null   # Set to limit number of validation samples
-  cache_data: false       # Set to false to save memory with large datasets
-  num_workers: 4
-  seed: 42
-  
-  # Dataset behavior
-  train_perturbation_mode: "random"   # random augmentations each epoch/sample
-  val_perturbation_mode: "fixed"      # fixed, deterministic perturbation for stable validation
-  resample_every_epoch: true           # reseed random perturbations every epoch
-  val_fixed_t: 0.5                     # fixed flow time for validation (0=start x0, 1=target x1)
-  
-  perturbation:
-    translation_std: 5.0  # Increased: Standard deviation for translation (Angstroms)
-    rotation_std: 1.5     # Increased: Standard deviation for rotation (radians)
-    torsion_std: 1.0      # Increased: Standard deviation for torsion angles (radians)
-    min_rmsd: 5.0         # Increased: Minimum RMSD after perturbation
-    max_rmsd: 15.0        # Increased: Maximum RMSD after perturbation
+  data_dir: train_data        # ✅ Relative path to current directory
+  split_file: null            # Use automatic 80/10/10 split
+  max_train_samples: 5000     # ✅ Use all ~18,000 PDBs
+  max_val_samples: 50        # ✅ Use 200 validation PDBs
+  num_workers: 8              # ✅ Increased for full dataset
+  # Note: Dynamic dataset samples 1 pose per PDB each epoch (natural augmentation)
 
+# Model dimensions (Optimized from overfit_test)
+model:
+  # Protein network
+  protein_input_scalar_dim: 76
+  protein_input_vector_dim: 31
+  protein_input_edge_scalar_dim: 39
+  protein_input_edge_vector_dim: 8
+  protein_hidden_scalar_dim: 64
+  protein_hidden_vector_dim: 16
+  protein_output_scalar_dim: 64
+  protein_output_vector_dim: 16
+  protein_num_layers: 4
+
+  # Ligand network
+  ligand_input_scalar_dim: 122
+  ligand_input_edge_scalar_dim: 44
+  ligand_hidden_scalar_dim: 64
+  ligand_hidden_vector_dim: 16
+  ligand_output_scalar_dim: 64
+  ligand_output_vector_dim: 16
+  ligand_num_layers: 4
+
+  # Interaction network (CRITICAL: optimized settings)
+  interaction_hidden_dim: 256
+  interaction_num_heads: 8
+  interaction_num_rbf: 32      # ✅ Rich distance encoding
+  interaction_pair_dim: 64     # ✅ Expressive pair bias (from overfit_test)
+  interaction_num_layers: 4    # ✅ Balanced capacity (~13M params)
+
+  # Velocity predictor
+  velocity_hidden_scalar_dim: 64
+  velocity_hidden_vector_dim: 16
+  velocity_num_layers: 4
+
+  dropout: 0.1                 # ✅ Regularization for large dataset
+
+# Training - Optimized for Full Dataset
 training:
-  batch_size: 8           # Process one sample at a time due to varying sizes
-  num_epochs: 200
-  learning_rate: 0.0005   # Starting learning rate for OneCycle
-  weight_decay: 0.00001
-  grad_clip: 1.0
-  gradient_accumulation_steps: 8  # Effective batch size = 1 * 8 = 8
-  save_every: 10          # Save checkpoint every N epochs
-  val_every: 2            # Validate every N epochs
-  checkpoint_dir: "checkpoints/equivariant"
-  use_amp: false          # Disabled - autocast not compatible with current PyTorch version
+  num_epochs: 500              # ✅ Full dataset needs fewer epochs
+  batch_size: 4               # ✅ Balanced for GPU memory (A100/V100)
+  num_timesteps_per_sample: 32  # ✅ 8 timesteps per pose (efficient)
+  val_batch_size: 8            # ✅ Validation batch size
+  learning_rate: 0.0005        # ✅ 5e-4 for stable large-scale training
+  gradient_clip: 1.0           # ✅ Reduced from 100.0 for stability
+  gradient_accumulation_steps: 2  # ✅ Effective batch = 16 × 8 × 2 = 256
+  # Effective batch size = batch_size × num_timesteps × accum_steps = 16 × 8 × 2 = 256
 
-loss:
-  smooth_l1_beta: 1.0     # Beta parameter for smooth L1 loss
-  lambda_traj: 0.1        # Trajectory consistency regularization
+  optimizer:
+    type: adam
+    weight_decay: 0.0          # ✅ No weight decay (dropout is sufficient)
+    betas: [0.9, 0.999]
+    eps: 1.0e-08
 
-logging:
-  use_wandb: false        # Set to true to use Weights & Biases
-  project: "flowfix-equivariant"
-  run_name: "flowfix_cue_base"
+  scheduler:
+    eta_max: 0.001             # ✅ 1e-3 maximum LR (conservative for full data)
+    T_0: 50                    # ✅ Longer cycle for full dataset
+    T_mult: 1                  # Keep constant cycle length
+    T_up: 10                   # ✅ 10 epoch warmup
+    gamma: 0.95                # ✅ 5% decay per cycle
 
-# Flow matching specific
-flow:
-  noise_schedule: "linear"  # Options: linear, cosine, sigmoid
-  num_timesteps: 1000
-  beta_start: 0.0001
-  beta_end: 0.02
-  
-# Physics parameters removed: training now purely uses pose perturbation without physics guidance
-  
-# Inference settings
-inference:
-  num_steps: 20           # Number of denoising steps (like DiffDock)
-  early_stop_step: 18     # Stop at step 18 to prevent overfitting (like DiffDock)
-  solver: "euler"         # Options: euler, rk4, dopri5
-  
-# Memory optimization
-# EMA settings (like DiffDock)
-ema:
-  enabled: true
-  decay: 0.999            # EMA decay rate
-  update_every: 1         # Update EMA every N steps
+  validation:
+    frequency: 2               # ✅ Validate every 2 epochs (large dataset)
+    save_best: true
+    early_stopping_patience: 100  # ✅ Increased patience for full training
 
-# DiffDock-style validation
-validation:
-  diffdock_every: 5       # Run DiffDock validation every N epochs
-  num_samples: 500        # Number of validation samples to evaluate
-  rmsd_thresholds: [2.0, 5.0]  # RMSD thresholds for success rate
+# Sampling
+sampling:
+  num_steps: 40
+  method: euler
 
-optimization:
-  gradient_checkpointing: false  # Enable for very deep models
-  cpu_offload: false             # Offload optimizer states to CPU
-  find_unused_parameters: false  # For DDP training
+# Experiment management (Unified save structure)
+experiment:
+  base_dir: save              # Base directory for all experiments
+  # run_name will be auto-generated as: flowfix_YYYYMMDD_HHMMSS
+
+# Checkpoints
+checkpoint:
+  save_freq: 10               # Save checkpoint every N epochs
+  save_latest: true           # Always save latest.pt
+  keep_last_n: 5              # Keep only last N checkpoints (set to -1 to keep all)
+
+# Visualization
+visualization:
+  enabled: true                # Enable validation animation
+  save_animation: true         # Save GIF animations during validation
+  animation_fps: 10            # Frames per second for GIF
+  num_samples: 1               # Number of samples to visualize per validation
+
+# WandB logging
+wandb:
+  enabled: true                # Enable WandB logging
+  project: "protein-ligand-flowfix"
+  entity: null                 # Your WandB username (optional)
+  name: null                   # Run name (auto-generated if null)
+  tags: ["flow-matching", "protein-ligand", "se3-equivariant"]
+  log_gradients: true          # Log gradient norms (total + module-level)
+  log_model_weights: true      # Log parameter statistics (module-level)
+  log_animations: true         # Log validation trajectory animations
