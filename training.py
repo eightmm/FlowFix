@@ -301,10 +301,6 @@ class FlowFixTrainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            # Scheduler step
-            if self.scheduler:
-                self.scheduler.step()
-
         # Calculate RMSD for monitoring (using replicated coordinates)
         with torch.no_grad():
             rmsd = torch.sqrt(torch.mean((x_t - replicated_ligand_coords_x1) ** 2))
@@ -644,6 +640,10 @@ class FlowFixTrainer:
                     'system/epoch': epoch,
                     'system/step': self.global_step
                 })
+
+            # Scheduler step (epoch-based)
+            if self.scheduler:
+                self.scheduler.step()
 
 
 def main():

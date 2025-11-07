@@ -9,7 +9,7 @@ data:
   data_dir: train_data        # ✅ Relative path to current directory
   split_file: null            # Use automatic 80/10/10 split
   max_train_samples: 5000     # ✅ Use all ~18,000 PDBs
-  max_val_samples: 50        # ✅ Use 200 validation PDBs
+  max_val_samples: 100        # ✅ Use 200 validation PDBs
   num_workers: 8              # ✅ Increased for full dataset
   # Note: Dynamic dataset samples 1 pose per PDB each epoch (natural augmentation)
 
@@ -51,9 +51,9 @@ model:
 
 # Training - Optimized for Full Dataset
 training:
-  num_epochs: 500              # ✅ Full dataset needs fewer epochs
-  batch_size: 4               # ✅ Balanced for GPU memory (A100/V100)
-  num_timesteps_per_sample: 32  # ✅ 8 timesteps per pose (efficient)
+  num_epochs: 5000              # ✅ Full dataset needs fewer epochs
+  batch_size: 8               # ✅ Balanced for GPU memory (A100/V100)
+  num_timesteps_per_sample: 16  # ✅ 8 timesteps per pose (efficient)
   val_batch_size: 8            # ✅ Validation batch size
   learning_rate: 0.0005        # ✅ 5e-4 for stable large-scale training
   gradient_clip: 1.0           # ✅ Reduced from 100.0 for stability
@@ -67,14 +67,14 @@ training:
     eps: 1.0e-08
 
   scheduler:
-    eta_max: 0.001             # ✅ 1e-3 maximum LR (conservative for full data)
-    T_0: 50                    # ✅ Longer cycle for full dataset
+    eta_max: 0.001             # Maximum LR (1e-3)
+    T_0: 50                    # First cycle length (50 epochs)
     T_mult: 1                  # Keep constant cycle length
-    T_up: 10                   # ✅ 10 epoch warmup
-    gamma: 0.95                # ✅ 5% decay per cycle
+    T_up: 10                   # Warmup period (10 epochs)
+    gamma: 0.95                # LR decay per cycle (5% decay)
 
   validation:
-    frequency: 2               # ✅ Validate every 2 epochs (large dataset)
+    frequency: 5               # ✅ Validate every 2 epochs (large dataset)
     save_best: true
     early_stopping_patience: 100  # ✅ Increased patience for full training
 

@@ -6,12 +6,14 @@ class CosineAnnealingWarmUpRestarts(_LRScheduler):
     """
     Implements the cosine annealing with warm-up and restarts learning rate schedule.
 
+    Note: This scheduler is designed to be called once per epoch (not per step).
+
     Args:
         optimizer (Optimizer): Wrapped optimizer.
-        T_0 (int): Number of iterations in the first cycle.
-        T_mult (int): Multiply factor to increase the number of iterations in each cycle.
+        T_0 (int): Number of epochs in the first cycle.
+        T_mult (int): Multiply factor to increase the number of epochs in each cycle.
         eta_max (float): Maximum learning rate.
-        T_up (int): Number of iterations with increasing learning rate at the start of each cycle.
+        T_up (int): Number of epochs with increasing learning rate at the start of each cycle.
         gamma (float): Decay factor for learning rate between cycles.
         last_epoch (int): Last epoch. Default: -1.
     """
