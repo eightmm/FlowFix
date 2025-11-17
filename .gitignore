@@ -73,7 +73,6 @@ temp/
 
 # Project specific
 docs/
-scripts/
 .cursorignore
 .kiro/
 FLOWFIX_GUIDE.md

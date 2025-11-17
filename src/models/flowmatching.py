@@ -64,8 +64,36 @@ class ProteinLigandFlowMatching(nn.Module):
 
                  # General parameters (unified hidden_dim for non-equivariant features)
                  hidden_dim: int = 256,  # Unified dimension for time, interaction, conditioning
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+
+                 # ESM embedding parameters
+                 use_esm_embeddings: bool = True,
+                 esmc_dim: int = 1152,  # ESMC 600M embedding dimension
+                 esm3_dim: int = 1536):  # ESM3 embedding dimension
         super().__init__()
+
+        # ESM embedding projection layers
+        self.use_esm_embeddings = use_esm_embeddings
+        if use_esm_embeddings:
+            self.esmc_projection = MLP(
+                in_dim=esmc_dim,
+                hidden_dim=protein_hidden_scalar_dim,
+                out_dim=protein_hidden_scalar_dim,
+                num_layers=2,
+                activation='silu',
+                dropout=dropout
+            )
+            self.esm3_projection = MLP(
+                in_dim=esm3_dim,
+                hidden_dim=protein_hidden_scalar_dim,
+                out_dim=protein_hidden_scalar_dim,
+                num_layers=2,
+                activation='silu',
+                dropout=dropout
+            )
+
+            # Learnable weights for combining ESM projections
+            self.esm_weight = nn.Parameter(torch.ones(2) * 0.5)  # [ESMC weight, ESM3 weight]
 
         self.protein_network = UnifiedEquivariantNetwork(
             input_scalar_dim=protein_input_scalar_dim,
@@ -220,6 +248,11 @@ class ProteinLigandFlowMatching(nn.Module):
         """
         # 1. Encode Protein and Ligand (time-free)
         # Protein is fixed, ligand coordinates x_t contain implicit time information
+
+        # Process ESM embeddings if available
+        if self.use_esm_embeddings:
+            protein_batch = self._integrate_esm_embeddings(protein_batch)
+
         protein_output = self.protein_network(protein_batch)
         ligand_output = self.ligand_network(ligand_batch)
 
@@ -252,6 +285,74 @@ class ProteinLigandFlowMatching(nn.Module):
 
         return velocity
 
+    def _integrate_esm_embeddings(self, protein_batch):
+        """
+        Integrate ESMC and ESM3 embeddings into protein node features.
+
+        Args:
+            protein_batch: PyG Batch with optional esmc_embeddings and esm3_embeddings
+
+        Returns:
+            Modified protein_batch with enhanced node features
+        """
+        # Check if ESM embeddings are available
+        has_esmc = hasattr(protein_batch, 'esmc_embeddings') and protein_batch.esmc_embeddings is not None
+        has_esm3 = hasattr(protein_batch, 'esm3_embeddings') and protein_batch.esm3_embeddings is not None
+
+        if not (has_esmc or has_esm3):
+            return protein_batch
+
+        # Get original scalar dimension
+        original_scalar_dim = protein_batch.x.shape[1]
+
+        # Project ESM embeddings (this creates the computational graph)
+        esm_features = []
+        weights = []
+
+        if has_esmc:
+            # Convert to float and enable gradient if needed
+            esmc_emb = protein_batch.esmc_embeddings.float()
+            esmc_proj = self.esmc_projection(esmc_emb)  # [N, hidden_scalar_dim]
+            esm_features.append(esmc_proj)
+            weights.append(self.esm_weight[0])
+
+        if has_esm3:
+            # Convert to float and enable gradient if needed
+            esm3_emb = protein_batch.esm3_embeddings.float()
+            esm3_proj = self.esm3_projection(esm3_emb)  # [N, hidden_scalar_dim]
+            esm_features.append(esm3_proj)
+            weights.append(self.esm_weight[1])
+
+        # Weighted combination of ESM projections
+        weights_tensor = torch.stack(weights)
+        weights_normalized = torch.softmax(weights_tensor, dim=0)
+
+        combined_esm = sum(w * feat for w, feat in zip(weights_normalized, esm_features))
+        # combined_esm: [N, hidden_scalar_dim]
+
+        # Project combined ESM back to original scalar dimension to preserve UnifiedEquivariantNetwork input
+        if not hasattr(self, '_esm_to_input'):
+            # Create projection layer on first call (lazy init to avoid device issues)
+            device = protein_batch.x.device
+            self._esm_to_input = MLP(
+                in_dim=self.protein_network.hidden_scalar_dim,
+                hidden_dim=original_scalar_dim,
+                out_dim=original_scalar_dim,
+                num_layers=1,
+                activation='silu'
+            ).to(device)
+
+        esm_to_input = self._esm_to_input(combined_esm)  # [N, original_scalar_dim]
+
+        # Create new node features with ESM enhancement (residual connection)
+        # This creates a new tensor in the computational graph
+        enhanced_x = protein_batch.x + esm_to_input  # [N, original_scalar_dim]
+
+        # Update batch.x directly (PyG allows this and preserves computational graph)
+        protein_batch.x = enhanced_x
+
+        return protein_batch
+
     def _init_weights(self):
         """
         Initialize weights for stable training.
@@ -263,6 +364,11 @@ class ProteinLigandFlowMatching(nn.Module):
         """
         # Initialize atom condition projection MLP (conservative for conditioning)
         self._init_mlp(self.vel_atom_condition_proj, gain=0.5)
+
+        # Initialize ESM projection MLPs (if enabled)
+        if self.use_esm_embeddings:
+            self._init_mlp(self.esmc_projection, gain=0.5)
+            self._init_mlp(self.esm3_projection, gain=0.5)
 
     def _init_mlp(self, mlp_module, gain=1.0):
         """

@@ -51,7 +51,12 @@ def build_model(model_config, device):
 
         # General parameters (unified hidden_dim for non-equivariant features)
         hidden_dim=model_config.get('hidden_dim', model_config.get('interaction_hidden_dim', 256)),
-        dropout=model_config.get('dropout', 0.1)
+        dropout=model_config.get('dropout', 0.1),
+
+        # ESM embedding parameters
+        use_esm_embeddings=model_config.get('use_esm_embeddings', True),
+        esmc_dim=model_config.get('esmc_dim', 1152),
+        esm3_dim=model_config.get('esm3_dim', 1536)
     ).to(device)
 
     return model

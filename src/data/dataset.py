@@ -39,11 +39,13 @@ class FlowFixDataset(Dataset):
         split: str = "train",
         max_samples: Optional[int] = None,
         seed: int = 42,
+        loading_mode: str = "lazy",  # lazy, preload, hybrid
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.seed = seed
         self.epoch = 0  # Track current epoch for reproducible sampling
+        self.loading_mode = loading_mode
 
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -93,6 +95,17 @@ class FlowFixDataset(Dataset):
 
         print(f"Loaded {len(self.pdb_ids)} valid PDBs for {split} split")
 
+        # Preload data based on loading_mode
+        self.preloaded_data = {}
+        if loading_mode == "preload":
+            print(f"Preloading all data into memory (mode: {loading_mode})...")
+            self._preload_all()
+        elif loading_mode == "hybrid":
+            print(f"Preloading proteins only (mode: {loading_mode})...")
+            self._preload_proteins()
+        else:
+            print(f"Using lazy loading (mode: {loading_mode})")
+
     def _load_split_from_tsv(self, all_pdbs: List[str], split_file: str) -> List[str]:
         """Load train/val/test split from TSV file."""
         import pandas as pd
@@ -109,6 +122,25 @@ class FlowFixDataset(Dataset):
         # Return intersection with available PDBs
         return [pdb for pdb in all_pdbs if pdb in split_pdbs]
 
+    def _preload_all(self):
+        """Preload all ligands and proteins into memory."""
+        for pdb_id in tqdm(self.pdb_ids, desc="Preloading all data"):
+            pdb_dir = self.data_dir / pdb_id
+            self.preloaded_data[pdb_id] = {
+                'ligands': torch.load(pdb_dir / "ligands.pt", weights_only=False),
+                'protein': torch.load(pdb_dir / "protein.pt", weights_only=False)
+            }
+        print(f"✓ Preloaded {len(self.preloaded_data)} PDBs into memory")
+
+    def _preload_proteins(self):
+        """Preload only proteins into memory (hybrid mode)."""
+        for pdb_id in tqdm(self.pdb_ids, desc="Preloading proteins"):
+            pdb_dir = self.data_dir / pdb_id
+            self.preloaded_data[pdb_id] = {
+                'protein': torch.load(pdb_dir / "protein.pt", weights_only=False)
+            }
+        print(f"✓ Preloaded {len(self.preloaded_data)} proteins into memory")
+
     def set_epoch(self, epoch: int):
         """Set epoch for reproducible random sampling across workers."""
         self.epoch = epoch
@@ -123,12 +155,19 @@ class FlowFixDataset(Dataset):
         pdb_id = self.pdb_ids[idx]
         pdb_dir = self.data_dir / pdb_id
 
-        # Load ligands and protein
-        ligands_path = pdb_dir / "ligands.pt"
-        protein_path = pdb_dir / "protein.pt"
-
-        ligands_list = torch.load(ligands_path, weights_only=False)
-        protein_data = torch.load(protein_path, weights_only=False)
+        # Load ligands and protein based on loading_mode
+        if self.loading_mode == "preload":
+            # Use preloaded data
+            ligands_list = self.preloaded_data[pdb_id]['ligands']
+            protein_data = self.preloaded_data[pdb_id]['protein']
+        elif self.loading_mode == "hybrid":
+            # Protein preloaded, ligand lazy
+            ligands_list = torch.load(pdb_dir / "ligands.pt", weights_only=False)
+            protein_data = self.preloaded_data[pdb_id]['protein']
+        else:
+            # Lazy loading (default)
+            ligands_list = torch.load(pdb_dir / "ligands.pt", weights_only=False)
+            protein_data = torch.load(pdb_dir / "protein.pt", weights_only=False)
 
         # Randomly sample one docked pose for this PDB
         # Use (epoch, idx) for deterministic sampling within each epoch
@@ -237,6 +276,12 @@ class FlowFixDataset(Dataset):
         if edge_vector_features is not None:
             filtered_graph.edge_vector_features = edge_vector_features
 
+        # Add ESM embeddings if available
+        if hasattr(protein_graph, 'esmc_embeddings') and protein_graph.esmc_embeddings is not None:
+            filtered_graph.esmc_embeddings = protein_graph.esmc_embeddings[pocket_mask]
+        if hasattr(protein_graph, 'esm3_embeddings') and protein_graph.esm3_embeddings is not None:
+            filtered_graph.esm3_embeddings = protein_graph.esm3_embeddings[pocket_mask]
+
         return filtered_graph
 
     def _extract_coords(self, data: Any) -> torch.Tensor:
@@ -343,7 +388,15 @@ class FlowFixDataset(Dataset):
                     else:
                         edge_vector_features = edge_vec_tuple.float()
 
-                return Data(
+                # Extract ESM embeddings if available
+                esmc_embeddings = None
+                esm3_embeddings = None
+                if 'esmc_embeddings' in node_data:
+                    esmc_embeddings = node_data['esmc_embeddings'].float()  # [N, 960 or 1152]
+                if 'esm3_embeddings' in node_data:
+                    esm3_embeddings = node_data['esm3_embeddings'].float()  # [N, 1536]
+
+                graph = Data(
                     x=x,
                     edge_index=edge_index,
                     edge_attr=edge_attr,
@@ -351,6 +404,14 @@ class FlowFixDataset(Dataset):
                     node_vector_features=node_vector_features,
                     edge_vector_features=edge_vector_features
                 )
+
+                # Add ESM embeddings as separate attributes
+                if esmc_embeddings is not None:
+                    graph.esmc_embeddings = esmc_embeddings
+                if esm3_embeddings is not None:
+                    graph.esm3_embeddings = esm3_embeddings
+
+                return graph
 
             # Ligand structure: node_feats (single tensor) in nested format
             elif 'node_feats' in node_data:
@@ -408,8 +469,35 @@ def collate_flowfix_batch(samples: List[Dict]) -> Dict[str, Any]:
     ligand_coords_x0 = torch.cat([s['ligand_coords_x0'] for s in samples], dim=0)
     ligand_coords_x1 = torch.cat([s['ligand_coords_x1'] for s in samples], dim=0)
 
-    # Collect distance bounds as a list (can't be batched due to different sizes)
-    distance_bounds = [s.get('distance_bounds', None) for s in samples]
+    # Pad and batch distance bounds to [B, N, N]
+    distance_bounds_list = [s.get('distance_bounds', None) for s in samples]
+
+    # Find max number of atoms in batch
+    max_atoms = 0
+    for bounds in distance_bounds_list:
+        if bounds is not None and 'lower' in bounds:
+            max_atoms = max(max_atoms, bounds['lower'].shape[0])
+
+    # Pad and stack distance bounds
+    if max_atoms > 0:
+        batch_size = len(samples)
+        distance_lower_bounds = torch.zeros(batch_size, max_atoms, max_atoms, dtype=torch.float32)
+        distance_upper_bounds = torch.zeros(batch_size, max_atoms, max_atoms, dtype=torch.float32)
+
+        for i, bounds in enumerate(distance_bounds_list):
+            if bounds is not None and 'lower' in bounds and 'upper' in bounds:
+                n_atoms = bounds['lower'].shape[0]
+                distance_lower_bounds[i, :n_atoms, :n_atoms] = bounds['lower']
+                distance_upper_bounds[i, :n_atoms, :n_atoms] = bounds['upper']
+
+        distance_bounds_padded = {
+            'lower': distance_lower_bounds,  # [B, N, N]
+            'upper': distance_upper_bounds,  # [B, N, N]
+            'num_atoms': torch.tensor([bounds['lower'].shape[0] if bounds and 'lower' in bounds else 0
+                                       for bounds in distance_bounds_list], dtype=torch.long)  # [B]
+        }
+    else:
+        distance_bounds_padded = None
 
     return {
         'pdb_ids': pdb_ids,
@@ -418,7 +506,7 @@ def collate_flowfix_batch(samples: List[Dict]) -> Dict[str, Any]:
         'ligand_coords_x0': ligand_coords_x0,
         'ligand_coords_x1': ligand_coords_x1,
         'ligand_batch': ligand_batch.batch,  # PyG batch indices
-        'distance_bounds': distance_bounds,  # List of per-molecule distance bounds
+        'distance_bounds': distance_bounds_padded,  # {'lower': [B, N, N], 'upper': [B, N, N], 'num_atoms': [B]}
     }
 
 

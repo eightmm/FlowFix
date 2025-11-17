@@ -1,13 +1,6 @@
 #!/usr/bin/env python
 """
-Overfitting Test script for FlowFix: Flow Matching for Protein-Ligand Pose Refinement
-
-This script uses the SAME data for both training and validation to test if the model
-can converge on a small dataset. If the model cannot overfit to a tiny dataset,
-there's likely a bug or the model architecture is problematic.
-
-Usage:
-    python train_overfit.py --config configs/overfit_test.yaml
+Simplified Training script for FlowFix: Flow Matching for Protein-Ligand Pose Refinement
 """
 
 import torch
@@ -19,13 +12,9 @@ import argparse
 from datetime import datetime
 import wandb
 
-from src.utils.data_utils import create_overfit_datasets, create_dataloaders
+from src.utils.data_utils import create_datasets, create_dataloaders
 from src.utils.model_builder import build_model
-from src.utils.training_utils import build_optimizer_and_scheduler
-from src.utils.loss_utils import (
-    compute_flow_matching_loss,
-    sample_timesteps_logistic_normal
-)
+from src.utils.training_utils import build_optimizer_and_scheduler, sample_timesteps_logistic_normal
 from src.utils.early_stop import EarlyStopping
 from src.utils.utils import set_random_seed
 from src.utils.visualization import MolecularVisualizer
@@ -33,9 +22,7 @@ from src.utils.experiment import ExperimentManager
 from src.utils.wandb_logger import (
     WandBLogger,
     extract_module_gradient_norms,
-    extract_gradient_stats_by_layer,
-    extract_parameter_histograms,
-    extract_parameter_stats_by_layer
+    extract_parameter_stats
 )
 
 
@@ -116,15 +103,12 @@ class FlowFixTrainer:
             self.visualizer = MolecularVisualizer(str(self.animation_dir))
 
     def setup_data(self):
-        """Setup datasets and dataloaders for overfitting test.
-
-        NOTE: Train and validation use the SAME data for convergence testing.
-        """
+        """Setup datasets and dataloaders."""
         data_config = self.config['data']
         training_config = self.config['training']
 
-        # Create datasets (train == val for overfitting test)
-        self.train_dataset, self.val_dataset, dataset_type = create_overfit_datasets(
+        # Create datasets
+        self.train_dataset, self.val_dataset, dataset_type = create_datasets(
             data_config,
             seed=self.config.get('seed', 42)
         )
@@ -137,10 +121,7 @@ class FlowFixTrainer:
             data_config
         )
 
-        self.exp_manager.logger.info(f"🧪 OVERFITTING TEST MODE 🧪")
-        self.exp_manager.logger.info(f"Training on {self.device} | {dataset_type} Dataset")
-        self.exp_manager.logger.info(f"⚠️  Train and Val use SAME data: {len(self.train_dataset)} samples")
-        self.exp_manager.logger.info(f"📊 Timesteps per sample: {training_config.get('num_timesteps_per_sample', 4)}")
+        self.exp_manager.logger.info(f"Training on {self.device} | {dataset_type} Dataset | Train: {len(self.train_dataset)} | Val: {len(self.val_dataset)} samples")
 
     def setup_model(self):
         """Initialize ProteinLigandFlowMatching model."""
@@ -212,11 +193,11 @@ class FlowFixTrainer:
         self.exp_manager.logger.info(f"  WandB dir: {self.exp_manager.get_wandb_dir()}")
 
     def train_step(self, batch):
-        """Single training step with flow matching and adaptive loss.
+        """Single training step with flow matching.
 
-        Samples multiple timesteps per PDB system with bimodal distribution
-        focusing on endpoints. Uses time-dependent weighting and auxiliary
-        losses for early trajectory guidance.
+        Samples multiple timesteps per PDB system for more efficient training.
+        For each PDB system in the batch, we sample num_timesteps_per_sample different
+        timesteps and compute the loss across all of them.
         """
         # Get number of timesteps to sample per system
         num_timesteps = self.config['training'].get('num_timesteps_per_sample', 4)
@@ -229,15 +210,22 @@ class FlowFixTrainer:
 
         original_batch_size = len(batch['pdb_ids'])
 
-        # Sample multiple timesteps for each PDB system using logistic-normal
+        # Sample multiple timesteps for each PDB system
+        # Shape: [original_batch_size, num_timesteps]
+        # Get sampling parameters from config
+        timestep_config = self.config.get('timestep_sampling', {})
+        mu = timestep_config.get('mu', 0.8)
+        sigma = timestep_config.get('sigma', 1.7)
+        mix_ratio = timestep_config.get('mix_ratio', 0.98)
+
         t_samples = []
         for _ in range(original_batch_size):
             t_for_system = sample_timesteps_logistic_normal(
                 num_timesteps,
                 device=self.device,
-                mu=0.0,
-                sigma=1.0,
-                mix_ratio=0.5
+                mu=mu,
+                sigma=sigma,
+                mix_ratio=mix_ratio
             )
             t_samples.append(t_for_system)
         t_all = torch.cat(t_samples, dim=0)  # [batch_size * num_timesteps]
@@ -294,13 +282,76 @@ class FlowFixTrainer:
         # True velocity: v = dx/dt = x1 - x0 (constant for linear path)
         true_velocity = replicated_ligand_coords_x1 - replicated_ligand_coords_x0
 
-        # Compute simple flow matching loss
-        batch_indices = ligand_batch_expanded.batch
-        loss, loss_dict = compute_flow_matching_loss(
-            pred_velocity=predicted_velocity,
-            true_velocity=true_velocity,
-            batch_indices=batch_indices
-        )
+        # Simple uniform flow matching loss
+        # Pure MSE loss on velocity field (no weighting, no coordinate loss)
+        # For linear interpolation, true velocity is constant across all t
+        loss = torch.nn.functional.mse_loss(predicted_velocity, true_velocity)
+
+        # Add distance geometry constraint loss (vectorized)
+        dg_loss_value = 0.0
+        if 'distance_bounds' in batch and batch['distance_bounds'] is not None:
+            bounds = batch['distance_bounds']
+            distance_lower_bounds = bounds['lower'].to(self.device)  # [original_batch_size, max_atoms, max_atoms]
+            distance_upper_bounds = bounds['upper'].to(self.device)  # [original_batch_size, max_atoms, max_atoms]
+            num_atoms = bounds['num_atoms'].to(self.device)  # [original_batch_size]
+            max_atoms = distance_lower_bounds.shape[1]
+
+            # One-step Euler integration to predict final coordinates
+            # dt = 1 - t (remaining time to reach crystal structure at t=1)
+            dt = (1 - t_all)[ligand_batch_expanded.batch].unsqueeze(-1)  # [N_ligand_total, 1]
+            x_pred = x_t + dt * predicted_velocity  # [N_ligand_total, 3]
+
+            # Reshape x_pred to [B*num_timesteps, max_atoms, 3] with padding (vectorized)
+            batch_size_expanded = original_batch_size * num_timesteps
+
+            # Use scatter to efficiently create padded tensor
+            x_pred_padded = torch.zeros(batch_size_expanded, max_atoms, 3, device=self.device)
+            batch_indices = ligand_batch_expanded.batch  # [N_total]
+
+            # Create atom indices for each molecule
+            atom_counts = torch.bincount(batch_indices, minlength=batch_size_expanded)  # [B*num_timesteps]
+            atom_offsets = torch.cat([torch.tensor([0], device=self.device), atom_counts.cumsum(0)[:-1]])  # [B*num_timesteps]
+
+            # Compute within-molecule atom indices
+            atom_indices_within_mol = torch.arange(len(batch_indices), device=self.device) - atom_offsets[batch_indices]
+
+            # Scatter x_pred into padded tensor
+            x_pred_padded[batch_indices, atom_indices_within_mol] = x_pred
+
+            # Replicate distance bounds for all timesteps: [B*num_timesteps, max_atoms, max_atoms]
+            lower_bounds_expanded = distance_lower_bounds.repeat_interleave(num_timesteps, dim=0)
+            upper_bounds_expanded = distance_upper_bounds.repeat_interleave(num_timesteps, dim=0)
+            num_atoms_expanded = num_atoms.repeat_interleave(num_timesteps)  # [B*num_timesteps]
+
+            # Compute pairwise distances for all molecules at once: [B*num_timesteps, max_atoms, max_atoms]
+            dists = torch.cdist(x_pred_padded, x_pred_padded)
+
+            # Compute violations
+            lower_violation = torch.relu(lower_bounds_expanded - dists)
+            upper_violation = torch.relu(dists - upper_bounds_expanded)
+
+            # Create mask for valid atoms (vectorized): [B*num_timesteps, max_atoms, max_atoms]
+            atom_range = torch.arange(max_atoms, device=self.device).unsqueeze(0)  # [1, max_atoms]
+            valid_atom_mask = atom_range < num_atoms_expanded.unsqueeze(1)  # [B*num_timesteps, max_atoms]
+            valid_mask = valid_atom_mask.unsqueeze(2) & valid_atom_mask.unsqueeze(1)  # [B*num_timesteps, max_atoms, max_atoms]
+
+            # Time-aware weighting: t=0 → weight=0, t=1 → weight=max_weight
+            # [B*num_timesteps, 1, 1] for broadcasting
+            max_dg_weight = self.config['training'].get('distance_geometry_weight', 0.1)
+            time_weight = t_all.unsqueeze(-1).unsqueeze(-1) * max_dg_weight  # [B*num_timesteps, 1, 1]
+            time_weight = time_weight.expand(-1, max_atoms, max_atoms)  # [B*num_timesteps, max_atoms, max_atoms]
+
+            # Apply mask and time-aware weight
+            masked_lower_violation = lower_violation * valid_mask.float() * time_weight
+            masked_upper_violation = upper_violation * valid_mask.float() * time_weight
+            dg_loss = (masked_lower_violation.sum() + masked_upper_violation.sum())
+
+            # Normalize by total number of samples
+            dg_loss = dg_loss / batch_size_expanded
+            dg_loss_value = dg_loss.item()
+
+            # Add to total loss (already weighted by time)
+            loss = loss + dg_loss
 
         # Scale loss for gradient accumulation
         gradient_accumulation_steps = self.config['training'].get('gradient_accumulation_steps', 1)
@@ -322,42 +373,27 @@ class FlowFixTrainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            # Scheduler step
-            if self.scheduler:
-                self.scheduler.step()
-
         # Calculate RMSD for monitoring (using replicated coordinates)
         with torch.no_grad():
             rmsd = torch.sqrt(torch.mean((x_t - replicated_ligand_coords_x1) ** 2))
 
-        # Log gradients if WandB is enabled
-        if self.wandb_enabled and self.config.get('wandb', {}).get('log_gradients', True):
-            # Extract and log gradient norms
-            total_norm, module_norms = extract_module_gradient_norms(self.model)
-            self.wandb_logger.log_gradient_norms(total_norm, module_norms, self.global_step)
+        # Log gradients and parameters if WandB is enabled
+        if self.wandb_enabled:
+            # Log gradient norms (every step)
+            if self.config.get('wandb', {}).get('log_gradients', True):
+                total_norm, module_norms = extract_module_gradient_norms(self.model)
+                self.wandb_logger.log_gradient_norms(total_norm, module_norms, self.global_step)
 
-            # Log detailed layer-wise gradient stats every 10 steps
-            if (self.global_step + 1) % 10 == 0:
-                layer_stats, layer_histograms = extract_gradient_stats_by_layer(self.model)
-                self.wandb_logger.log_gradient_stats_by_layer(layer_stats)
-                self.wandb_logger.log_gradient_histograms(layer_histograms)
-
-            # Log parameter stats and changes every 10 steps
-            if (self.global_step + 1) % 10 == 0:
-                layer_stats, self.param_history = extract_parameter_stats_by_layer(
-                    self.model, self.param_history
-                )
-                self.wandb_logger.log_parameter_stats_by_layer(layer_stats)
-
-            # Log parameter histograms every 50 steps
-            if (self.global_step + 1) % 50 == 0:
-                module_hists, layer_hists, type_hists = extract_parameter_histograms(self.model)
-                self.wandb_logger.log_parameter_histograms(module_hists, layer_hists, type_hists)
+            # Log parameter stats every 50 steps
+            if self.config.get('wandb', {}).get('log_model_weights', True):
+                if (self.global_step + 1) % 50 == 0:
+                    module_stats = extract_parameter_stats(self.model)
+                    self.wandb_logger.log_parameter_stats(module_stats)
 
         return {
             'loss': loss.item(),
-            'velocity_loss': loss_dict['velocity_loss'],
-            'rmsd': rmsd.item()
+            'rmsd': rmsd.item(),
+            'dg_loss': dg_loss_value
         }
 
 
@@ -399,7 +435,26 @@ class FlowFixTrainer:
             batch_size = len(batch['pdb_ids'])
             num_steps = self.config['sampling'].get('num_steps', 50)
             method = self.config['sampling'].get('method', 'euler')
-            dt = 1.0 / num_steps
+            schedule = self.config['sampling'].get('schedule', 'uniform')
+
+            # Generate timestep schedule
+            if schedule == 'uniform':
+                # Evenly spaced timesteps
+                timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
+            elif schedule == 'quadratic':
+                # Dense sampling near t=1 (crystal) - inverse quadratic
+                # Small dt at late times (t~1), large dt at early times (t~0)
+                timesteps = 1 - (1 - torch.linspace(0, 1, num_steps + 1, device=self.device)) ** 1.5
+            elif schedule == 'root':
+                # Alternative: root-based schedule (also dense at late)
+                timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device) ** (2/3)
+            elif schedule == 'sigmoid':
+                # Very dense sampling near t=1
+                raw = torch.linspace(-6, 6, num_steps + 1, device=self.device)
+                timesteps = torch.sigmoid(raw)
+            else:
+                # Default to uniform
+                timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
 
             current_coords = ligand_coords_x0.clone()
             
@@ -425,7 +480,12 @@ class FlowFixTrainer:
                 trajectory_rmsds.append(initial_rmsd.item())
 
             for step in range(num_steps):
-                t = torch.ones(batch_size, device=self.device) * (step * dt)
+                t_current = timesteps[step]
+                t_next = timesteps[step + 1]
+                dt = t_next - t_current
+
+                # Broadcast t to batch size
+                t = torch.ones(batch_size, device=self.device) * t_current
 
                 # Create batch with current coordinates
                 ligand_batch_t = ligand_batch.clone()
@@ -439,20 +499,21 @@ class FlowFixTrainer:
                     trajectory_velocities.append(velocity[sample_mask].clone())
 
                 if method == 'euler':
-                    # Euler step
+                    # Euler step with variable dt
                     current_coords = current_coords + dt * velocity
                 elif method == 'rk4':
-                    # RK4 integration (more accurate)
+                    # RK4 integration with variable dt
                     k1 = velocity
 
+                    t_mid = t_current + 0.5 * dt
                     ligand_batch_t.pos = (current_coords + 0.5 * dt * k1).clone()
-                    k2 = self.model(protein_batch, ligand_batch_t, t + 0.5 * dt)
+                    k2 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_mid)
 
                     ligand_batch_t.pos = (current_coords + 0.5 * dt * k2).clone()
-                    k3 = self.model(protein_batch, ligand_batch_t, t + 0.5 * dt)
+                    k3 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_mid)
 
                     ligand_batch_t.pos = (current_coords + dt * k3).clone()
-                    k4 = self.model(protein_batch, ligand_batch_t, t + dt)
+                    k4 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_next)
 
                     current_coords = current_coords + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
@@ -612,27 +673,34 @@ class FlowFixTrainer:
             # Training
             self.model.train()
             epoch_losses = []
+            epoch_rmsds = []
+            epoch_dg_losses = []
 
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
             for batch in pbar:
                 metrics = self.train_step(batch)
                 epoch_losses.append(metrics['loss'])
+                epoch_rmsds.append(metrics['rmsd'])
+                epoch_dg_losses.append(metrics['dg_loss'])
                 self.global_step += 1
 
                 pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
-                    'rmsd': f"{metrics['rmsd']:.3f}"
+                    'rmsd': f"{metrics['rmsd']:.3f}",
+                    'dg': f"{metrics['dg_loss']:.4f}"
                 })
-                
+
                 # Log to WandB every 10 steps
                 if self.wandb_enabled and self.global_step % 10 == 0:
-                    self.wandb_logger.log_training_step(
-                        loss=metrics['loss'],
-                        rmsd=metrics['rmsd'],
-                        lr=self.optimizer.param_groups[0]['lr'],
-                        epoch=epoch,
-                        step=self.global_step
-                    )
+                    log_dict = {
+                        'train/step_loss': metrics['loss'],
+                        'train/step_rmsd': metrics['rmsd'],
+                        'train/step_dg_loss': metrics['dg_loss'],
+                        'train/learning_rate': self.optimizer.param_groups[0]['lr'],
+                        'meta/epoch': epoch,
+                        'meta/step': self.global_step
+                    }
+                    self.wandb_logger.log(log_dict)
 
             # Validation (skip epoch 0)
             early_stop = False
@@ -664,19 +732,32 @@ class FlowFixTrainer:
             # Print summary
             current_lr = self.optimizer.param_groups[0]['lr']
             avg_epoch_loss = np.mean(epoch_losses)
+            avg_epoch_rmsd = np.mean(epoch_rmsds)
+            avg_epoch_dg_loss = np.mean(epoch_dg_losses)
             print(f"\nEpoch {epoch} Summary:")
             print(f"  📊 Train Loss: {avg_epoch_loss:.4f}")
+            print(f"  📏 Train RMSD: {avg_epoch_rmsd:.3f} Å")
+            print(f"  🔗 Distance Geometry Loss: {avg_epoch_dg_loss:.4f}")
             print(f"  📈 Learning Rate: {current_lr:.6f}")
             print(f"  ⏰ Early stopping: {self.early_stopper.counter}/{self.early_stopper.patience}")
-            
-            # Log epoch summary to WandB (early stopping counter)
+
+            # Log epoch summary to WandB
             if self.wandb_enabled:
                 self.wandb_logger.log({
-                    'system/early_stopping_counter': self.early_stopper.counter,
-                    'system/early_stopping_patience': self.early_stopper.patience,
-                    'system/epoch': epoch,
-                    'system/step': self.global_step
+                    # Training epoch averages
+                    'train/epoch_loss': avg_epoch_loss,
+                    'train/epoch_rmsd': avg_epoch_rmsd,
+                    'train/epoch_dg_loss': avg_epoch_dg_loss,
+                    # System info
+                    'meta/early_stopping_counter': self.early_stopper.counter,
+                    'meta/early_stopping_patience': self.early_stopper.patience,
+                    'meta/epoch': epoch,
+                    'meta/step': self.global_step
                 })
+
+            # Scheduler step (epoch-based)
+            if self.scheduler:
+                self.scheduler.step()
 
 
 def main():

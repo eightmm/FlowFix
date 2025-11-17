@@ -11,6 +11,10 @@ data:
   max_train_samples: 5000     # ✅ Use all ~18,000 PDBs
   max_val_samples: 100        # ✅ Use 200 validation PDBs
   num_workers: 8              # ✅ Increased for full dataset
+  loading_mode: lazy          # lazy, preload, hybrid
+  # lazy: Load data from disk on-the-fly (memory efficient, slower)
+  # preload: Load all data into memory at init (fast, memory intensive ~180GB for 18k PDBs)
+  # hybrid: Preload proteins only, lazy load ligands (balanced, ~50GB)
   # Note: Dynamic dataset samples 1 pose per PDB each epoch (natural augmentation)
 
 # Model dimensions (Optimized from overfit_test)
@@ -56,8 +60,9 @@ training:
   num_timesteps_per_sample: 16  # ✅ 8 timesteps per pose (efficient)
   val_batch_size: 8            # ✅ Validation batch size
   learning_rate: 0.0005        # ✅ 5e-4 for stable large-scale training
-  gradient_clip: 1.0           # ✅ Reduced from 100.0 for stability
-  gradient_accumulation_steps: 2  # ✅ Effective batch = 16 × 8 × 2 = 256
+  gradient_clip: 100.0           # ✅ Reduced from 100.0 for stability
+  gradient_accumulation_steps: 4  # ✅ Effective batch = 16 × 8 × 2 = 256
+  distance_geometry_weight: 0.1  # ✅ Weight for distance geometry constraint loss
   # Effective batch size = batch_size × num_timesteps × accum_steps = 16 × 8 × 2 = 256
 
   optimizer:
@@ -67,10 +72,10 @@ training:
     eps: 1.0e-08
 
   scheduler:
-    eta_max: 0.001             # Maximum LR (1e-3)
-    T_0: 50                    # First cycle length (50 epochs)
+    eta_max: 0.003             # Maximum LR (1e-3)
+    T_0: 20                    # First cycle length (50 epochs)
     T_mult: 1                  # Keep constant cycle length
-    T_up: 10                   # Warmup period (10 epochs)
+    T_up: 5                   # Warmup period (10 epochs)
     gamma: 0.95                # LR decay per cycle (5% decay)
 
   validation:
@@ -78,10 +83,21 @@ training:
     save_best: true
     early_stopping_patience: 100  # ✅ Increased patience for full training
 
-# Sampling
+# Sampling (Inference/Validation)
 sampling:
   num_steps: 40
-  method: euler
+  method: euler  # euler, rk4
+  schedule: quadratic  # uniform, quadratic, root, sigmoid
+  # Uniform: evenly spaced (dt=constant)
+  # Quadratic: dense sampling near t=1 (small dt at late, large dt at early) - RECOMMENDED
+  # Root: similar to quadratic but gentler
+  # Sigmoid: very dense near t=1 (extreme)
+
+# Training timestep sampling
+timestep_sampling:
+  mu: 0.8              # Mean of logistic-normal (before sigmoid)
+  sigma: 1.7           # Std of logistic-normal
+  mix_ratio: 0.98      # 98% logistic-normal + 2% uniform (following paper)
 
 # Experiment management (Unified save structure)
 experiment:

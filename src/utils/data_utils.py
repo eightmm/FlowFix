@@ -17,13 +17,17 @@ def create_datasets(data_config, seed=42):
     Returns:
         Tuple of (train_dataset, val_dataset, dataset_type)
     """
+    # Get loading mode from config
+    loading_mode = data_config.get('loading_mode', 'lazy')
+
     # Training dataset (dynamic pose sampling)
     train_dataset = FlowFixDataset(
         data_dir=data_config.get('data_dir', 'train_data'),
         split='train',
         split_file=data_config.get('split_file', None),
         max_samples=data_config.get('max_train_samples', None),
-        seed=seed
+        seed=seed,
+        loading_mode=loading_mode
     )
 
     # Validation dataset (dynamic pose sampling)
@@ -32,7 +36,8 @@ def create_datasets(data_config, seed=42):
         split='valid',
         split_file=data_config.get('split_file', None),
         max_samples=data_config.get('max_val_samples', None),
-        seed=seed
+        seed=seed,
+        loading_mode=loading_mode
     )
 
     dataset_type = "Dynamic"
@@ -54,13 +59,17 @@ def create_overfit_datasets(data_config, seed=42):
     Returns:
         Tuple of (train_dataset, val_dataset, dataset_type)
     """
+    # Get loading mode from config
+    loading_mode = data_config.get('loading_mode', 'lazy')
+
     # Training dataset (use 'train' split but with limited samples)
     train_dataset = FlowFixDataset(
         data_dir=data_config.get('data_dir', 'train_data'),
         split='train',
         split_file=data_config.get('split_file', None),
         max_samples=data_config.get('max_train_samples', 5),  # Small dataset for overfitting
-        seed=seed
+        seed=seed,
+        loading_mode=loading_mode
     )
 
     # Validation dataset: Use SAME data as training for overfitting test
@@ -70,7 +79,8 @@ def create_overfit_datasets(data_config, seed=42):
         split='train',  # Same as training!
         split_file=data_config.get('split_file', None),
         max_samples=data_config.get('max_train_samples', 5),  # Same samples as training
-        seed=seed
+        seed=seed,
+        loading_mode=loading_mode
     )
 
     dataset_type = "Dynamic (Overfit)"
