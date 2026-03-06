@@ -11,34 +11,34 @@ FlowFix refines perturbed protein-ligand binding poses back to crystal structure
 ```mermaid
 flowchart TB
     subgraph inputs["Inputs"]
-        P["Protein Graph\n(scalar + vector features)"]
-        L["Ligand Graph\n(scalar features + x_t coords)"]
-        T["t (timestep)\n[B] in [0,1]"]
+        P["Protein Graph<br/>(scalar + vector features)"]
+        L["Ligand Graph<br/>(scalar features + x_t coords)"]
+        T["t (timestep)<br/>[B] in [0,1]"]
     end
 
     subgraph encoding["1. Feature Encoding"]
-        ESM["ESM Embedding Integration\nESMC (1152d) + ESM3 (1536d)\n-> Weighted projection -> Residual add"]
-        PN["Protein Network\nUnifiedEquivariantNetwork\n3 GatingEquivariantLayers"]
-        LN["Ligand Network\nUnifiedEquivariantNetwork\n3 GatingEquivariantLayers"]
+        ESM["ESM Embedding Integration<br/>ESMC (1152d) + ESM3 (1536d)<br/>-> Weighted projection -> Residual add"]
+        PN["Protein Network<br/>UnifiedEquivariantNetwork<br/>3 GatingEquivariantLayers"]
+        LN["Ligand Network<br/>UnifiedEquivariantNetwork<br/>3 GatingEquivariantLayers"]
     end
 
     subgraph interaction["2. Protein-Ligand Interaction"]
-        PROJ["Equivariant -> Scalar Projection\nEquivariantMLP per molecule type"]
-        SEQ["PyG -> Padded Sequence\nDynamic padding per batch"]
-        PAIR["Pair Bias Construction\nRBF (32) + interaction types + dist features"]
-        ATT["Pair-Bias Attention Blocks x2\n+ FFN + LayerNorm + Residual"]
-        POOL["Global Pooling\nMean + Std -> [B, D*2]"]
+        PROJ["Equivariant -> Scalar Projection<br/>EquivariantMLP per molecule type"]
+        SEQ["PyG -> Padded Sequence<br/>Dynamic padding per batch"]
+        PAIR["Pair Bias Construction<br/>RBF (32) + interaction types + dist features"]
+        ATT["Pair-Bias Attention Blocks x2<br/>+ FFN + LayerNorm + Residual"]
+        POOL["Global Pooling<br/>Mean + Std -> [B, D*2]"]
     end
 
     subgraph velocity["3. Velocity Prediction"]
-        COND["Condition Assembly\nprotein_global [B,512] + lig_interaction [N,256]\n-> MLP -> atom_condition [N,256]"]
-        VINP["Velocity Input Projection\nEquivariantMLP: ligand_irreps -> vel_hidden_irreps"]
-        VBLK["Velocity Blocks x4\nGatingEquivariantLayer\nwith AdaLN conditioning"]
-        VOUT["Velocity Output\nEquivariantMLP -> 1x1o (3D vector)\n* learnable scale (init=0.1)"]
+        COND["Condition Assembly<br/>protein_global [B,512] + lig_interaction [N,256]<br/>-> MLP -> atom_condition [N,256]"]
+        VINP["Velocity Input Projection<br/>EquivariantMLP: ligand_irreps -> vel_hidden_irreps"]
+        VBLK["Velocity Blocks x4<br/>GatingEquivariantLayer<br/>with AdaLN conditioning"]
+        VOUT["Velocity Output<br/>EquivariantMLP -> 1x1o (3D vector)<br/>* learnable scale (init=0.1)"]
     end
 
     subgraph output["Output"]
-        V["Velocity Field\n[N_ligand, 3]"]
+        V["Velocity Field<br/>[N_ligand, 3]"]
     end
 
     P --> ESM --> PN
@@ -75,14 +75,14 @@ Shared architecture for both protein and ligand encoding. Uses cuEquivariance fo
 ```mermaid
 flowchart LR
     subgraph input["Input"]
-        NF["Node Features\n[N, scalar_dim]\n(+ [N, vec_dim, 3])"]
-        EF["Edge Features\n[E, edge_dim]\n(+ [E, edge_vec_dim, 3])"]
-        POS["Positions\n[N, 3]"]
+        NF["Node Features<br/>[N, scalar_dim]<br/>(+ [N, vec_dim, 3])"]
+        EF["Edge Features<br/>[E, edge_dim]<br/>(+ [E, edge_vec_dim, 3])"]
+        POS["Positions<br/>[N, 3]"]
     end
 
     subgraph processing["Processing"]
-        NP["Node Processor\nEquivariantMLP (3-layer)\nin_irreps -> hidden_irreps"]
-        EP["Edge Processor\nEquivariantMLP (2-layer)\nedge_irreps -> edge_hidden"]
+        NP["Node Processor<br/>EquivariantMLP (3-layer)<br/>in_irreps -> hidden_irreps"]
+        EP["Edge Processor<br/>EquivariantMLP (2-layer)<br/>edge_irreps -> edge_hidden"]
 
         subgraph layers["GatingEquivariantLayer x N"]
             direction TB
@@ -95,7 +95,7 @@ flowchart LR
             L1 --> BN1 --> L2 --> BN2 --> L3 --> BN3
         end
 
-        OP["Output Projection\nEquivariantMLP (2-layer)\nhidden_irreps -> out_irreps"]
+        OP["Output Projection<br/>EquivariantMLP (2-layer)<br/>hidden_irreps -> out_irreps"]
     end
 
     NF --> NP --> layers
@@ -104,7 +104,7 @@ flowchart LR
     layers --> OP
 
     subgraph output["Output"]
-        OUT["Node Features\n[N, out_irreps.dim]"]
+        OUT["Node Features<br/>[N, out_irreps.dim]"]
     end
 
     OP --> OUT
@@ -122,43 +122,43 @@ The fundamental SE(3)-equivariant message passing layer used throughout the mode
 ```mermaid
 flowchart TB
     subgraph input["Input"]
-        H["node_features\n[N, irreps.dim]"]
+        H["node_features<br/>[N, irreps.dim]"]
         POS["positions [N, 3]"]
         EI["edge_index [2, E]"]
         EA["edge_attr [E, edge_dim]"]
-        COND["condition [N, cond_dim]\n(optional)"]
+        COND["condition [N, cond_dim]<br/>(optional)"]
     end
 
     subgraph conditioning["0. Input Conditioning"]
-        ADALN_IN["EquivariantAdaLN\nscalar: LayerNorm + scale/bias\nvector: norm-based gating"]
+        ADALN_IN["EquivariantAdaLN<br/>scalar: LayerNorm + scale/bias<br/>vector: norm-based gating"]
     end
 
     subgraph edges["Edge Processing"]
-        SH["Spherical Harmonics\nY_l(r_ij), l=0,1,2"]
-        EE["Edge Embedding\nMLP(edge_attr) -> [E, hidden]"]
-        EF["edge_features =\ncat(edge_emb, edge_sh)"]
+        SH["Spherical Harmonics<br/>Y_l(r_ij), l=0,1,2"]
+        EE["Edge Embedding<br/>MLP(edge_attr) -> [E, hidden]"]
+        EF["edge_features =<br/>cat(edge_emb, edge_sh)"]
     end
 
     subgraph message["Message Passing"]
-        TP["Tensor Product (message)\nnode[src] x edge_features -> messages"]
-        MLP_MSG["Message MLP\nEquivariantMLP"]
-        IMP["Edge Importance\nMLP(src_scalar, dst_scalar, edge_emb)\n-> sigmoid -> weight"]
-        SG["Scalar Gating\nMLP(edge_emb) -> sigmoid"]
-        VG["Vector Gating\nnorm features + edge_emb\n-> MLP -> sigmoid"]
-        AGG["Scatter Sum\n[E, D] -> [N, D]"]
+        TP["Tensor Product (message)<br/>node[src] x edge_features -> messages"]
+        MLP_MSG["Message MLP<br/>EquivariantMLP"]
+        IMP["Edge Importance<br/>MLP(src_scalar, dst_scalar, edge_emb)<br/>-> sigmoid -> weight"]
+        SG["Scalar Gating<br/>MLP(edge_emb) -> sigmoid"]
+        VG["Vector Gating<br/>norm features + edge_emb<br/>-> MLP -> sigmoid"]
+        AGG["Scatter Sum<br/>[E, D] -> [N, D]"]
     end
 
     subgraph self_int["Self-Interaction"]
-        TP_SELF["Tensor Product (self)\nnode x ones -> self_update"]
+        TP_SELF["Tensor Product (self)<br/>node x ones -> self_update"]
     end
 
     subgraph update["Node Update"]
         ADD["aggregated + self_update"]
-        NMLP["Node Update MLP\nEquivariantMLP"]
+        NMLP["Node Update MLP<br/>EquivariantMLP"]
         BN["Equivariant BatchNorm"]
-        ADALN_OUT["EquivariantAdaLN\n(output conditioning)"]
+        ADALN_OUT["EquivariantAdaLN<br/>(output conditioning)"]
         DO["Equivariant Dropout"]
-        SKIP["Skip Connection\noutput + identity"]
+        SKIP["Skip Connection<br/>output + identity"]
     end
 
     H --> ADALN_IN
@@ -178,7 +178,7 @@ flowchart TB
     COND --> ADALN_OUT
 
     subgraph output["Output"]
-        OUT["updated node_features\n[N, out_irreps.dim]"]
+        OUT["updated node_features<br/>[N, out_irreps.dim]"]
     end
 
     SKIP --> OUT
@@ -198,43 +198,43 @@ Cross-attention between protein and ligand using NVIDIA's cuEquivariance `attent
 ```mermaid
 flowchart TB
     subgraph input["Input"]
-        PO["Protein Output\n[N_p, prot_irreps]"]
-        LO["Ligand Output\n[N_l, lig_irreps]"]
+        PO["Protein Output<br/>[N_p, prot_irreps]"]
+        LO["Ligand Output<br/>[N_l, lig_irreps]"]
     end
 
     subgraph projection["Equivariant -> Scalar"]
-        P2S["protein_to_scalar\nEquivariantMLP (2-layer)\nprot_irreps -> hidden_dim x 0e"]
-        L2S["ligand_to_scalar\nEquivariantMLP (2-layer)\nlig_irreps -> hidden_dim x 0e"]
+        P2S["protein_to_scalar<br/>EquivariantMLP (2-layer)<br/>prot_irreps -> hidden_dim x 0e"]
+        L2S["ligand_to_scalar<br/>EquivariantMLP (2-layer)<br/>lig_irreps -> hidden_dim x 0e"]
     end
 
     subgraph sequence["Sequence Conversion"]
-        SEQ["PyG -> Padded Sequence\n[B, max_N, D] + mask"]
-        CAT["Concatenate\ncombined = [prot_seq | lig_seq]\n[B, N_p+N_l, D]"]
+        SEQ["PyG -> Padded Sequence<br/>[B, max_N, D] + mask"]
+        CAT["Concatenate<br/>combined = [prot_seq | lig_seq]<br/>[B, N_p+N_l, D]"]
     end
 
     subgraph pair["Pair Bias"]
-        DIST["Pairwise Distance\ntorch.cdist"]
-        RBF["RBF Features (32)\nexp(-(d-c)^2 / 2w^2)"]
-        TYPE["Interaction Types\nPP / PL / LL flags"]
-        FEAT["Additional Features\ninv_dist, norm_dist, node_mask"]
-        PPROJ["Pair Projection\nMLP: (32+6) -> pair_dim"]
+        DIST["Pairwise Distance<br/>torch.cdist"]
+        RBF["RBF Features (32)<br/>exp(-(d-c)^2 / 2w^2)"]
+        TYPE["Interaction Types<br/>PP / PL / LL flags"]
+        FEAT["Additional Features<br/>inv_dist, norm_dist, node_mask"]
+        PPROJ["Pair Projection<br/>MLP: (32+6) -> pair_dim"]
     end
 
     subgraph attention["Attention Stack x2"]
         direction TB
-        ATTN["PairBiasAttentionLayer\nQKV projection (no bias)\ncuequivariance attention_pair_bias\n8 heads, pair_dim=64"]
-        ANORM["LayerNorm + Dropout\n+ Residual"]
-        FFN["FFN Block\nMLP: D -> 2D -> D (SiLU)"]
-        FNORM["LayerNorm + Dropout\n+ Residual"]
+        ATTN["PairBiasAttentionLayer<br/>QKV projection (no bias)<br/>cuequivariance attention_pair_bias<br/>8 heads, pair_dim=64"]
+        ANORM["LayerNorm + Dropout<br/>+ Residual"]
+        FFN["FFN Block<br/>MLP: D -> 2D -> D (SiLU)"]
+        FNORM["LayerNorm + Dropout<br/>+ Residual"]
         ATTN --> ANORM --> FFN --> FNORM
     end
 
     subgraph output["Output"]
-        GSKIP["Global Skip Connection\nh + h_initial"]
+        GSKIP["Global Skip Connection<br/>h + h_initial"]
         SPLIT["Split Protein / Ligand"]
-        P2PYG["Sequence -> PyG\nprot_out [N_p, D]"]
-        L2PYG["Sequence -> PyG\nlig_out [N_l, D]"]
-        GPOOL["Mean+Std Pooling\nprot_global [B, D*2]\nlig_global [B, D*2]"]
+        P2PYG["Sequence -> PyG<br/>prot_out [N_p, D]"]
+        L2PYG["Sequence -> PyG<br/>lig_out [N_l, D]"]
+        GPOOL["Mean+Std Pooling<br/>prot_global [B, D*2]<br/>lig_global [B, D*2]"]
     end
 
     PO --> P2S --> SEQ
@@ -264,32 +264,32 @@ How the final velocity vectors are computed from encoded features.
 ```mermaid
 flowchart TB
     subgraph input["Inputs from Previous Stages"]
-        LO["ligand_output\n[N_l, lig_irreps]\nfrom LigandNetwork"]
-        PG["protein_global\n[B, hidden_dim*2]\nmean+std pooling"]
-        LI["lig_out\n[N_l, hidden_dim]\nfrom InteractionNetwork"]
+        LO["ligand_output<br/>[N_l, lig_irreps]<br/>from LigandNetwork"]
+        PG["protein_global<br/>[B, hidden_dim*2]<br/>mean+std pooling"]
+        LI["lig_out<br/>[N_l, hidden_dim]<br/>from InteractionNetwork"]
     end
 
     subgraph condition["Condition Assembly"]
-        EXP["Expand protein_global\n[B, D*2] -> [N_l, D*2]\nvia batch indices"]
-        CAT["Concatenate\n[N_l, D*2 + D] = [N_l, D*3]"]
-        CPROJ["Condition MLP\nMLP: D*3 -> D*3 -> D\natom_condition [N_l, D]"]
+        EXP["Expand protein_global<br/>[B, D*2] -> [N_l, D*2]<br/>via batch indices"]
+        CAT["Concatenate<br/>[N_l, D*2 + D] = [N_l, D*3]"]
+        CPROJ["Condition MLP<br/>MLP: D*3 -> D*3 -> D<br/>atom_condition [N_l, D]"]
     end
 
     subgraph velocity_net["Velocity Network"]
-        VINP["Input Projection\nEquivariantMLP (2-layer)\nlig_irreps -> vel_hidden_irreps"]
-        SAVE["Save h_initial\nfor global skip"]
+        VINP["Input Projection<br/>EquivariantMLP (2-layer)<br/>lig_irreps -> vel_hidden_irreps"]
+        SAVE["Save h_initial<br/>for global skip"]
 
         subgraph blocks["GatingEquivariantLayer x4"]
-            B1["Block 1\n+ AdaLN(atom_condition)"]
+            B1["Block 1<br/>+ AdaLN(atom_condition)"]
             B2["Block 2"]
             B3["Block 3"]
             B4["Block 4"]
             B1 --> B2 --> B3 --> B4
         end
 
-        GSKIP["Global Skip\nh + h_initial"]
-        VOUT["Output MLP\nEquivariantMLP (3-layer)\nvel_hidden -> 1x1o"]
-        SCALE["Learnable Scale\n* velocity_scale (init=0.1)"]
+        GSKIP["Global Skip<br/>h + h_initial"]
+        VOUT["Output MLP<br/>EquivariantMLP (3-layer)<br/>vel_hidden -> 1x1o"]
+        SCALE["Learnable Scale<br/>* velocity_scale (init=0.1)"]
     end
 
     subgraph output["Output"]
@@ -316,24 +316,24 @@ How pre-trained protein language model embeddings are integrated.
 ```mermaid
 flowchart LR
     subgraph input["Input"]
-        PX["protein.x\n[N, 76]"]
-        ESMC["esmc_embeddings\n[N, 1152]"]
-        ESM3["esm3_embeddings\n[N, 1536]"]
+        PX["protein.x<br/>[N, 76]"]
+        ESMC["esmc_embeddings<br/>[N, 1152]"]
+        ESM3["esm3_embeddings<br/>[N, 1536]"]
     end
 
     subgraph projection["Projection"]
-        P1["ESMC Projection\nMLP: 1152 -> 128 -> 128"]
-        P2["ESM3 Projection\nMLP: 1536 -> 128 -> 128"]
+        P1["ESMC Projection<br/>MLP: 1152 -> 128 -> 128"]
+        P2["ESM3 Projection<br/>MLP: 1536 -> 128 -> 128"]
     end
 
     subgraph combine["Weighted Combination"]
-        W["Learnable Weights\nsoftmax([w_esmc, w_esm3])"]
-        WS["Weighted Sum\nw1*esmc_proj + w2*esm3_proj"]
+        W["Learnable Weights<br/>softmax([w_esmc, w_esm3])"]
+        WS["Weighted Sum<br/>w1*esmc_proj + w2*esm3_proj"]
     end
 
     subgraph integrate["Integration"]
-        B2I["Back to Input Dim\nMLP: 128 -> 76 -> 76"]
-        RES["Residual Add\nprotein.x + esm_proj"]
+        B2I["Back to Input Dim<br/>MLP: 128 -> 76 -> 76"]
+        RES["Residual Add<br/>protein.x + esm_proj"]
     end
 
     ESMC --> P1 --> WS
@@ -343,7 +343,7 @@ flowchart LR
     PX --> RES
 
     subgraph output["Output"]
-        OUT["enhanced protein.x\n[N, 76]"]
+        OUT["enhanced protein.x<br/>[N, 76]"]
     end
 
     RES --> OUT
@@ -358,24 +358,24 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph data["Data Loading"]
-        DS["FlowFixDataset\n1 random pose per PDB per epoch"]
-        DL["DataLoader + collate\nPyG Batch"]
+        DS["FlowFixDataset<br/>1 random pose per PDB per epoch"]
+        DL["DataLoader + collate<br/>PyG Batch"]
     end
 
     subgraph train_step["Training Step"]
-        TS["Sample Timesteps\nLogistic-Normal(mu=0.8, sigma=1.7)\nnum_timesteps_per_sample x batch_size"]
-        REP["Replicate Batch\nEach PDB x num_timesteps"]
-        INTERP["Linear Interpolation\nx_t = (1-t)*x0 + t*x1"]
-        FWD["Model Forward\nv_pred = model(protein, ligand_t, t)"]
-        LOSS["MSE Loss\n||v_pred - (x1-x0)||^2"]
-        DG["Distance Geometry Loss\nBond length/angle constraints\nTime-weighted (stronger near t=1)"]
-        TOTAL["Total Loss\nMSE + DG_weight * DG_loss"]
-        BACK["Backward + Grad Clip (1.0)\n+ Gradient Accumulation"]
+        TS["Sample Timesteps<br/>Logistic-Normal(mu=0.8, sigma=1.7)<br/>num_timesteps_per_sample x batch_size"]
+        REP["Replicate Batch<br/>Each PDB x num_timesteps"]
+        INTERP["Linear Interpolation<br/>x_t = (1-t)*x0 + t*x1"]
+        FWD["Model Forward<br/>v_pred = model(protein, ligand_t, t)"]
+        LOSS["MSE Loss<br/>||v_pred - (x1-x0)||^2"]
+        DG["Distance Geometry Loss<br/>Bond length/angle constraints<br/>Time-weighted (stronger near t=1)"]
+        TOTAL["Total Loss<br/>MSE + DG_weight * DG_loss"]
+        BACK["Backward + Grad Clip (1.0)<br/>+ Gradient Accumulation"]
     end
 
     subgraph schedule["Learning Rate"]
         OPT["Adam (lr=1e-4, eps=1e-8)"]
-        SCHED["Cosine Annealing\nmin_lr=1e-6, epoch-based"]
+        SCHED["Cosine Annealing<br/>min_lr=1e-6, epoch-based"]
     end
 
     DS --> DL --> TS --> REP --> INTERP --> FWD --> LOSS --> TOTAL --> BACK
@@ -392,7 +392,7 @@ flowchart LR
         X0["x_0 (docked pose)"]
         STEP["For each timestep t_i:"]
         VEL["v = model(protein, ligand_t, t_i)"]
-        EULER["Euler: x += dt * v\nor RK4: 4-stage update"]
+        EULER["Euler: x += dt * v<br/>or RK4: 4-stage update"]
         X1["x_1 (refined pose)"]
     end
 
@@ -456,24 +456,24 @@ flowchart LR
 
 ```mermaid
 graph TD
-    FM["ProteinLigandFlowMatching\n(flowmatching.py)"]
+    FM["ProteinLigandFlowMatching<br/>(flowmatching.py)"]
 
-    PN["UnifiedEquivariantNetwork\n(Protein)\n(network.py)"]
-    LN["UnifiedEquivariantNetwork\n(Ligand)\n(network.py)"]
-    IN["ProteinLigandInteractionNetwork\n(network.py)"]
+    PN["UnifiedEquivariantNetwork<br/>(Protein)<br/>(network.py)"]
+    LN["UnifiedEquivariantNetwork<br/>(Ligand)<br/>(network.py)"]
+    IN["ProteinLigandInteractionNetwork<br/>(network.py)"]
 
-    GEL["GatingEquivariantLayer\n(cue_layers.py)"]
-    EMLP["EquivariantMLP\n(cue_layers.py)"]
-    PBA["PairBiasAttentionLayer\n(cue_layers.py)"]
-    ADALN_E["EquivariantAdaLN\n(cue_layers.py)"]
-    EBN["EquivariantBatchNorm\n(cue_torch)"]
+    GEL["GatingEquivariantLayer<br/>(cue_layers.py)"]
+    EMLP["EquivariantMLP<br/>(cue_layers.py)"]
+    PBA["PairBiasAttentionLayer<br/>(cue_layers.py)"]
+    ADALN_E["EquivariantAdaLN<br/>(cue_layers.py)"]
+    EBN["EquivariantBatchNorm<br/>(cue_torch)"]
 
-    MLP["MLP\n(torch_layers.py)"]
-    ADALN["AdaLN\n(torch_layers.py)"]
-    CTB["ConditionedTransitionBlock\n(torch_layers.py)"]
-    SWIG["SwiGLU\n(torch_layers.py)"]
+    MLP["MLP<br/>(torch_layers.py)"]
+    ADALN["AdaLN<br/>(torch_layers.py)"]
+    CTB["ConditionedTransitionBlock<br/>(torch_layers.py)"]
+    SWIG["SwiGLU<br/>(torch_layers.py)"]
 
-    CUE["cuequivariance_torch\nSphericalHarmonics\nFullyConnectedTensorProduct\nLinear\nattention_pair_bias"]
+    CUE["cuequivariance_torch<br/>SphericalHarmonics<br/>FullyConnectedTensorProduct<br/>Linear<br/>attention_pair_bias"]
 
     FM --> PN
     FM --> LN

@@ -92,18 +92,18 @@ Velocity field (orange arrows)를 따라 crystal structure 방향으로 이동.
 ```mermaid
 flowchart LR
     subgraph enc["1. Encoding"]
-        P["Protein\n(scalar+vector)"] --> PN["ProteinNetwork\n3x GatingEquivLayer"]
-        L["Ligand\n(scalar only)"] --> LN["LigandNetwork\n3x GatingEquivLayer"]
+        P["Protein<br/>(scalar+vector)"] --> PN["ProteinNetwork<br/>3x GatingEquivLayer"]
+        L["Ligand<br/>(scalar only)"] --> LN["LigandNetwork<br/>3x GatingEquivLayer"]
         ESM["ESMC+ESM3"] -.-> PN
     end
 
     subgraph int["2. Interaction"]
-        PN --> ATT["Pair-Bias Attention\n(2 layers, 8 heads)"]
+        PN --> ATT["Pair-Bias Attention<br/>(2 layers, 8 heads)"]
         LN --> ATT
     end
 
     subgraph vel["3. Velocity"]
-        ATT -->|"condition"| VEL["4x GatingEquivLayer\n+ AdaLN conditioning"]
+        ATT -->|"condition"| VEL["4x GatingEquivLayer<br/>+ AdaLN conditioning"]
         LN -->|"features"| VEL
         VEL --> V["v [N_l, 3]"]
     end
