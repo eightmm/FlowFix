@@ -2,7 +2,7 @@
 
 > **SE(3)-Equivariant Flow Matching for Protein-Ligand Pose Refinement**
 >
-> Last updated: 2025-02-18
+> Last updated: 2026-03-06
 
 ---
 
@@ -155,12 +155,12 @@ flowchart LR
 
 ## Changelog
 
-### 2025-02-18 - v4 Baseline Results
+### 2026-02-18 - v4 Baseline Results
 - Full validation on 200 PDBs (11,543 poses)
 - 20-step Euler ODE with EMA model
 - Mean RMSD: 3.20A -> 2.64A, Success rate <2A: 30.4% -> 44.6%
 
-### 2025-02 - Joint Graph Architecture (v4, current)
+### 2026-02 - Joint Graph Architecture (v4, current)
 - Joint protein-ligand graph with 4 edge types (PP, LL, LL intra, PL cross)
 - 8x GatingEquivariantLayer with time AdaLN conditioning
 - cuEquivariance tensor product for SE(3) equivariance

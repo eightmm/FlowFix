@@ -2,7 +2,7 @@
 
 > **SE(3)-Equivariant Flow Matching for Protein-Ligand Pose Refinement**
 >
-> Last updated: 2025-03-06
+> Last updated: 2026-03-06
 >
 > Trained model: `rectified-flow-full-v4` (joint graph, 8-layer, ~13M params)
 
