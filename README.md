@@ -117,5 +117,3 @@ python inference.py \
 
 - [Architecture](docs/ARCHITECTURE.md) - Detailed model architecture with Mermaid diagrams
 - [Progress Report](reports/progress.md) - Training results and analysis
-- [SLURM Guide](docs/SLURM_GUIDE.md) - Cluster job submission
-- [Multi-GPU Guide](docs/MULTI_GPU_GUIDE.md) - DDP training setup
