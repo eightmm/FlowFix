@@ -56,7 +56,10 @@ def build_model(model_config, device):
         # ESM embedding parameters
         use_esm_embeddings=model_config.get('use_esm_embeddings', True),
         esmc_dim=model_config.get('esmc_dim', 1152),
-        esm3_dim=model_config.get('esm3_dim', 1536)
+        esm3_dim=model_config.get('esm3_dim', 1536),
+
+        # Output mode: 'cartesian' or 'torsion'
+        output_mode=model_config.get('output_mode', 'cartesian'),
     ).to(device)
 
     return model

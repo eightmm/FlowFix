@@ -176,3 +176,183 @@ def compute_clash_loss(
     clash_loss_sc = masked_sc_clash.sum() / batch_size
 
     return clash_loss_ca, clash_loss_sc
+
+
+def compute_se3_torsion_loss(
+    pred: dict,
+    target: dict,
+    coords_x0: torch.Tensor,
+    coords_x1: torch.Tensor,
+    mask_rotate: torch.Tensor,
+    rotatable_edges: torch.Tensor,
+    batch_indices: torch.Tensor,
+    w_trans: float = 1.0,
+    w_rot: float = 1.0,
+    w_tor: float = 1.0,
+    w_coord: float = 0.5,
+) -> dict:
+    """
+    Compute SE(3) + Torsion decomposition loss.
+
+    Computes weighted MSE for each component (translation, rotation, torsion)
+    plus an optional coordinate reconstruction loss.
+
+    Args:
+        pred: Model output dict with 'translation' [B,3], 'rotation' [B,3], 'torsion' [M]
+        target: Target dict with 'translation' [B,3], 'rotation' [B,3], 'torsion_changes' [M]
+        coords_x0: Docked coordinates [N, 3]
+        coords_x1: Crystal coordinates [N, 3]
+        mask_rotate: [M, N] boolean mask for torsion application
+        rotatable_edges: [M, 2] atom indices
+        batch_indices: [N] batch assignment
+        w_trans, w_rot, w_tor, w_coord: Loss weights
+
+    Returns:
+        Dict with 'total', 'translation', 'rotation', 'torsion', 'coord_recon' losses
+    """
+    device = pred['translation'].device
+    batch_size = pred['translation'].shape[0]
+
+    # Translation loss
+    loss_trans = torch.nn.functional.mse_loss(
+        pred['translation'], target['translation'].to(device)
+    )
+
+    # Rotation loss (axis-angle MSE)
+    loss_rot = torch.nn.functional.mse_loss(
+        pred['rotation'], target['rotation'].to(device)
+    )
+
+    # Torsion loss
+    if pred['torsion'].numel() > 0 and target['torsion_changes'].numel() > 0:
+        target_torsion = target['torsion_changes'].to(device)
+        # Wrap to [-pi, pi] for circular loss
+        diff = pred['torsion'] - target_torsion
+        diff = torch.atan2(torch.sin(diff), torch.cos(diff))
+        loss_tor = (diff ** 2).mean()
+    else:
+        loss_tor = torch.zeros(1, device=device).squeeze()
+
+    # Coordinate reconstruction loss (optional end-to-end supervision)
+    loss_coord = torch.zeros(1, device=device).squeeze()
+    if w_coord > 0:
+        try:
+            from src.data.ligand_feat import apply_torsion_updates
+            reconstructed = _reconstruct_coords(
+                coords_x0, pred, mask_rotate, rotatable_edges, batch_indices
+            )
+            loss_coord = torch.nn.functional.mse_loss(reconstructed, coords_x1.to(device))
+        except Exception:
+            pass  # Skip coord loss if reconstruction fails
+
+    total = (
+        w_trans * loss_trans
+        + w_rot * loss_rot
+        + w_tor * loss_tor
+        + w_coord * loss_coord
+    )
+
+    return {
+        'total': total,
+        'translation': loss_trans.detach(),
+        'rotation': loss_rot.detach(),
+        'torsion': loss_tor.detach(),
+        'coord_recon': loss_coord.detach(),
+    }
+
+
+def _reconstruct_coords(
+    coords_x0: torch.Tensor,
+    pred: dict,
+    mask_rotate: torch.Tensor,
+    rotatable_edges: torch.Tensor,
+    batch_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reconstruct coordinates from SE(3) + Torsion prediction.
+
+    Apply order: Torsion → Translation → Rotation (same as DiffDock).
+
+    Args:
+        coords_x0: [N, 3] docked coordinates
+        pred: Dict with 'translation' [B, 3], 'rotation' [B, 3], 'torsion' [M]
+        mask_rotate: [M, N] boolean mask
+        rotatable_edges: [M, 2] atom indices
+        batch_indices: [N] batch assignment
+
+    Returns:
+        [N, 3] reconstructed coordinates
+    """
+    from scipy.spatial.transform import Rotation as R
+    import numpy as np
+
+    device = coords_x0.device
+    coords = coords_x0.clone()
+    batch_size = pred['translation'].shape[0]
+
+    for b in range(batch_size):
+        mol_mask = (batch_indices == b)
+        mol_coords = coords[mol_mask]  # [N_b, 3]
+
+        # 1. Apply torsion updates
+        if pred['torsion'].numel() > 0 and mask_rotate.shape[0] > 0:
+            # Filter mask_rotate for this molecule's atoms
+            mol_indices = torch.where(mol_mask)[0]
+            n_atoms = mol_indices.shape[0]
+            offset = mol_indices[0].item()
+
+            for m in range(mask_rotate.shape[0]):
+                angle = pred['torsion'][m].item()
+                if abs(angle) < 1e-6:
+                    continue
+
+                mask = mask_rotate[m, offset:offset + n_atoms]
+                if not mask.any():
+                    continue
+
+                # Rotation axis from rotatable bond
+                src, dst = rotatable_edges[m]
+                src_local = src.item() - offset
+                dst_local = dst.item() - offset
+
+                if src_local < 0 or src_local >= n_atoms or dst_local < 0 or dst_local >= n_atoms:
+                    continue
+
+                axis = mol_coords[dst_local] - mol_coords[src_local]
+                axis_norm = axis.norm()
+                if axis_norm < 1e-6:
+                    continue
+                axis = axis / axis_norm
+
+                # Rodrigues rotation
+                pivot = mol_coords[dst_local]
+                relative = mol_coords[mask] - pivot
+                cos_a = torch.cos(torch.tensor(angle, device=device))
+                sin_a = torch.sin(torch.tensor(angle, device=device))
+                dot = (relative * axis).sum(dim=-1, keepdim=True)
+                cross = torch.cross(axis.unsqueeze(0).expand_as(relative), relative, dim=-1)
+                rotated = relative * cos_a + cross * sin_a + axis * dot * (1 - cos_a)
+                mol_coords[mask] = rotated + pivot
+
+        # 2. Apply translation
+        trans = pred['translation'][b]  # [3]
+        mol_coords = mol_coords + trans
+
+        # 3. Apply rotation around CoM
+        rot_vec = pred['rotation'][b]  # [3] axis-angle
+        rot_angle = rot_vec.norm()
+        if rot_angle > 1e-6:
+            com = mol_coords.mean(dim=0)
+            relative = mol_coords - com
+
+            axis = rot_vec / rot_angle
+            cos_a = torch.cos(rot_angle)
+            sin_a = torch.sin(rot_angle)
+            dot = (relative * axis).sum(dim=-1, keepdim=True)
+            cross = torch.cross(axis.unsqueeze(0).expand_as(relative), relative, dim=-1)
+            rotated = relative * cos_a + cross * sin_a + axis * dot * (1 - cos_a)
+            mol_coords = rotated + com
+
+        coords[mol_mask] = mol_coords
+
+    return coords

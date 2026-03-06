@@ -1,0 +1,117 @@
+# FlowFix SE(3) + Torsion Decomposition Training Configuration
+# Output: translation [3] + rotation [3] + torsion [M] instead of per-atom velocity [N, 3]
+
+device: cuda
+seed: 42
+
+# Data
+data:
+  data_dir: train_data
+  split_file: train_data/splits.json
+  max_train_samples: null
+  max_val_samples: null
+  num_workers: 8
+  loading_mode: lazy
+  timestep_sampling:
+    method: uniform
+    num_timesteps_per_sample: 1
+
+# Model - SE(3) + Torsion output mode
+model:
+  architecture: separate  # Uses ProteinLigandFlowMatching (separate encoders + interaction)
+  output_mode: torsion    # NEW: 'cartesian' (default) or 'torsion' (SE(3) + torsion decomposition)
+
+  # Protein input dims
+  protein_input_scalar_dim: 76
+  protein_input_vector_dim: 31
+  protein_input_edge_scalar_dim: 39
+  protein_input_edge_vector_dim: 8
+
+  # Ligand input dims
+  ligand_input_scalar_dim: 122
+  ligand_input_edge_scalar_dim: 44
+
+  # Hidden dims
+  hidden_scalar_dim: 128
+  hidden_vector_dim: 32
+  hidden_edge_dim: 128
+
+  # Time conditioning
+  hidden_dim: 256
+
+  # ESM embedding
+  esm_proj_dim: 128
+
+  self_conditioning: false
+  dropout: 0.1
+
+# Training
+training:
+  num_epochs: 500
+  batch_size: 32
+  val_batch_size: 32
+  gradient_clip: 10.0
+  gradient_accumulation_steps: 1
+
+  # SE(3) + Torsion loss weights
+  torsion_loss:
+    w_trans: 1.0        # Translation MSE weight
+    w_rot: 1.0          # Rotation MSE weight
+    w_tor: 1.0          # Torsion circular MSE weight
+    w_coord: 0.5        # Coordinate reconstruction weight (end-to-end)
+
+  distance_geometry_weight: 0.0  # Disabled for torsion mode (built-in constraints)
+
+  ema:
+    enabled: true
+    decay: 0.999
+  compile: false  # Disable for initial debugging
+
+  optimizer:
+    type: muon
+    muon:
+      lr: 0.005
+      momentum: 0.95
+      weight_decay: 0.0
+      min_lr: 0.0005
+    adamw:
+      lr: 0.0003
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      min_lr: 0.00003
+
+  schedule:
+    warmup_fraction: 0.05
+    plateau_fraction: 0.80
+    decay_fraction: 0.15
+
+  validation:
+    frequency: 20
+    early_stopping_patience: 30
+
+# Sampling
+sampling:
+  num_steps: 20
+  method: euler
+  schedule: uniform
+
+# Experiment
+experiment:
+  base_dir: save
+
+checkpoint:
+  save_freq: 10
+  save_latest: true
+  keep_last_n: 5
+
+visualization:
+  enabled: true
+  save_animation: true
+  animation_fps: 10
+  num_samples: 1
+
+wandb:
+  enabled: true
+  project: "protein-ligand-flowfix"
+  tags: ["flow-matching", "se3-torsion", "decomposition"]
