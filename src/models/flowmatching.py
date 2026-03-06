@@ -3,16 +3,11 @@ SE(3)-Equivariant Flow Matching for Protein-Ligand Pose Refinement.
 
 This module implements a flow matching model that refines ligand docked poses
 to crystal poses using SE(3)-equivariant neural networks.
-
-Supports two output modes:
-- 'cartesian': Per-atom velocity [N_ligand, 3] (original)
-- 'torsion': SE(3) + Torsion decomposition: translation [3] + rotation [3] + torsion [M]
 """
 
 import torch
 import torch.nn as nn
 import cuequivariance as cue_base
-from torch_scatter import scatter_mean
 
 from .cue_layers import EquivariantMLP, GatingEquivariantLayer
 from .torch_layers import MLP
@@ -74,13 +69,8 @@ class ProteinLigandFlowMatching(nn.Module):
                  # ESM embedding parameters
                  use_esm_embeddings: bool = True,
                  esmc_dim: int = 1152,  # ESMC 600M embedding dimension
-                 esm3_dim: int = 1536,  # ESM3 embedding dimension
-
-                 # Output mode: 'cartesian' (per-atom velocity) or 'torsion' (SE(3) + torsion)
-                 output_mode: str = 'cartesian'):
+                 esm3_dim: int = 1536):  # ESM3 embedding dimension
         super().__init__()
-
-        self.output_mode = output_mode
 
         # ESM embedding projection layers
         self.use_esm_embeddings = use_esm_embeddings
@@ -161,8 +151,6 @@ class ProteinLigandFlowMatching(nn.Module):
             f"{self.ligand_scalar_dim}x0e + {self.ligand_output_vector_dim}x1o + {self.ligand_output_vector_dim}x1e"
         )
 
-        self._vel_hidden_scalar_dim = velocity_hidden_scalar_dim
-
         vel_hidden_irreps = cue_base.Irreps(
             "O3",
             f"{velocity_hidden_scalar_dim}x0e + {velocity_hidden_vector_dim}x1o + {velocity_hidden_vector_dim}x1e"
@@ -236,58 +224,13 @@ class ProteinLigandFlowMatching(nn.Module):
         # Learnable velocity scale
         self.velocity_scale = nn.Parameter(torch.ones(1) * 0.1)
 
-        # SE(3) + Torsion output heads (only when output_mode='torsion')
-        if self.output_mode == 'torsion':
-            # Translation head: pooled ligand features → 3D vector (equivariant)
-            self.translation_output = EquivariantMLP(
-                irreps_in=vel_hidden_irreps,
-                irreps_hidden=intermediate_irreps,
-                irreps_out=cue_base.Irreps("O3", "1x1o"),  # 3D translation vector
-                num_layers=2,
-                dropout=dropout,
-            )
-
-            # Rotation head: pooled ligand features → 3D axis-angle (equivariant)
-            self.rotation_output = EquivariantMLP(
-                irreps_in=vel_hidden_irreps,
-                irreps_hidden=intermediate_irreps,
-                irreps_out=cue_base.Irreps("O3", "1x1o"),  # 3D rotation (axis-angle)
-                num_layers=2,
-                dropout=dropout,
-            )
-
-            # Torsion head: src/dst node scalars → 1 scalar per rotatable bond
-            # Input: concat of src and dst node scalar features
-            torsion_input_dim = velocity_hidden_scalar_dim * 2
-            self.torsion_output = MLP(
-                in_dim=torsion_input_dim,
-                hidden_dim=velocity_hidden_scalar_dim,
-                out_dim=1,  # 1 scalar per rotatable bond
-                num_layers=2,
-                activation='silu',
-            )
-
-            # Zero-initialize torsion output for stable training
-            with torch.no_grad():
-                for module in self.torsion_output.layers:
-                    if isinstance(module, nn.Linear):
-                        nn.init.zeros_(module.weight)
-                        if module.bias is not None:
-                            nn.init.zeros_(module.bias)
-
-            # Learnable scales for each component
-            self.translation_scale = nn.Parameter(torch.ones(1) * 0.1)
-            self.rotation_scale = nn.Parameter(torch.ones(1) * 0.1)
-            self.torsion_scale = nn.Parameter(torch.ones(1) * 0.1)
-
         # Apply custom initialization
         self._init_weights()
 
     def forward(self,
                 protein_batch,
                 ligand_batch,
-                t: torch.Tensor,
-                rotatable_edges: torch.Tensor = None) -> dict:
+                t: torch.Tensor) -> torch.Tensor:
         """
         Predict velocity field for ligand refinement.
 
@@ -295,33 +238,36 @@ class ProteinLigandFlowMatching(nn.Module):
             protein_batch: PyG Batch for protein (fixed)
             ligand_batch: PyG Batch for ligand at time t
             t: [B] time values in [0, 1] (kept for API compatibility, not used)
-            rotatable_edges: [M, 2] rotatable bond atom indices (src, dst).
-                Required when output_mode='torsion'.
 
         Returns:
-            If output_mode='cartesian':
-                [N_ligand, 3] velocity vectors for ligand atoms
-            If output_mode='torsion':
-                dict with 'translation' [B, 3], 'rotation' [B, 3], 'torsion' [M]
+            [N_ligand, 3] velocity vectors for ligand atoms
+
+        Note:
+            Time information is implicit in ligand_batch.pos (x_t coordinates).
+            For linear interpolation: v = x_1 - x_0 (constant, time-independent).
         """
-        # 1. Encode Protein and Ligand
+        # 1. Encode Protein and Ligand (time-free)
+        # Protein is fixed, ligand coordinates x_t contain implicit time information
+
+        # Process ESM embeddings if available
         if self.use_esm_embeddings:
             protein_batch = self._integrate_esm_embeddings(protein_batch)
 
         protein_output = self.protein_network(protein_batch)
         ligand_output = self.ligand_network(ligand_batch)
 
-        # 2. Protein-Ligand Interaction
+        # 2. Protein-Ligand Interaction (time-free)
         (_, lig_out), (protein_context, _), _ = self.interaction_network(
             protein_output, ligand_output, protein_batch, ligand_batch
         )
 
         # 3. Velocity Prediction with combined global + local conditioning
-        protein_context_expanded = protein_context[ligand_batch.batch]
-        combined_condition = torch.cat([protein_context_expanded, lig_out], dim=-1)
-        atom_condition = self.vel_atom_condition_proj(combined_condition)
+        protein_context_expanded = protein_context[ligand_batch.batch]  # [N_ligand, hidden_dim*2]
+        combined_condition = torch.cat([protein_context_expanded, lig_out], dim=-1)  # [N_ligand, hidden_dim*3]
+        atom_condition = self.vel_atom_condition_proj(combined_condition)  # [N_ligand, hidden_dim]
 
         h = self.vel_input_projection(ligand_output)
+
         h_initial = h
 
         for block in self.velocity_blocks:
@@ -330,48 +276,14 @@ class ProteinLigandFlowMatching(nn.Module):
                 ligand_batch.pos,
                 ligand_batch.edge_index,
                 ligand_batch.edge_attr,
-                condition=atom_condition
+                condition=atom_condition  # Atom-wise condition with interaction info
             )
 
         h = h + h_initial
 
-        if self.output_mode == 'cartesian':
-            velocity = self.vel_output(h) * self.velocity_scale
-            return velocity
+        velocity = self.vel_output(h) * self.velocity_scale
 
-        # --- SE(3) + Torsion output ---
-        # h: [N_ligand, hidden_irreps] (per-atom features after message passing)
-
-        # Translation: mean-pool per molecule → 3D vector
-        h_pooled = scatter_mean(h, ligand_batch.batch, dim=0)  # [B, hidden_irreps]
-        translation = self.translation_output(h_pooled) * self.translation_scale  # [B, 3]
-
-        # Rotation: mean-pool per molecule → 3D axis-angle
-        rotation = self.rotation_output(h_pooled) * self.rotation_scale  # [B, 3]
-
-        # Torsion: src/dst node scalar features → 1 scalar per rotatable bond
-        if rotatable_edges is not None and rotatable_edges.shape[0] > 0:
-            src_idx = rotatable_edges[:, 0]  # [M]
-            dst_idx = rotatable_edges[:, 1]  # [M]
-
-            # Extract scalar part of h (first hidden_scalar_dim components)
-            # h is in irreps format: scalar_dim x 0e + vector_dim x 1o + vector_dim x 1e
-            # Scalars are the first `velocity_hidden_scalar_dim` entries
-            h_scalar = h[:, :self._vel_hidden_scalar_dim]  # [N_ligand, scalar_dim]
-
-            src_feat = h_scalar[src_idx]  # [M, scalar_dim]
-            dst_feat = h_scalar[dst_idx]  # [M, scalar_dim]
-            edge_feat = torch.cat([src_feat, dst_feat], dim=-1)  # [M, scalar_dim * 2]
-
-            torsion = self.torsion_output(edge_feat).squeeze(-1) * self.torsion_scale  # [M]
-        else:
-            torsion = torch.zeros(0, device=h.device)
-
-        return {
-            'translation': translation,  # [B, 3]
-            'rotation': rotation,         # [B, 3]
-            'torsion': torsion,           # [M]
-        }
+        return velocity
 
     def _integrate_esm_embeddings(self, protein_batch):
         """

@@ -206,9 +206,6 @@ class FlowFixDataset(Dataset):
         if 'distance_upper_bounds' in ligand_data:
             distance_bounds['upper'] = ligand_data['distance_upper_bounds']
 
-        # Extract torsion decomposition if available
-        torsion_data = self._extract_torsion_data(ligand_data)
-
         return {
             'pdb_id': pdb_id,
             'protein_graph': protein_graph,
@@ -216,7 +213,6 @@ class FlowFixDataset(Dataset):
             'ligand_coords_x0': ligand_coords_x0,
             'ligand_coords_x1': ligand_coords_x1,
             'distance_bounds': distance_bounds if distance_bounds else None,
-            'torsion_data': torsion_data,
         }
 
     def _extract_pocket(self, protein_data: Any, protein_coords: torch.Tensor,
@@ -287,100 +283,6 @@ class FlowFixDataset(Dataset):
             filtered_graph.esm3_embeddings = protein_graph.esm3_embeddings[pocket_mask]
 
         return filtered_graph
-
-    def _extract_torsion_data(self, ligand_data: dict) -> Optional[Dict[str, torch.Tensor]]:
-        """
-        Extract SE(3) + Torsion decomposition data from ligand data.
-
-        Computes on-the-fly from coordinates if pre-computed data is not available.
-
-        Returns:
-            Dict with:
-                - 'translation': [3] translation velocity (x1_com - x0_com)
-                - 'rotation': [3] rotation velocity (axis-angle)
-                - 'torsion_changes': [M] torsion angle changes (radians)
-                - 'rotatable_edges': [M, 2] atom indices of rotatable bonds
-                - 'mask_rotate': [M, N] boolean mask for torsion application
-            Or None if decomposition cannot be computed.
-        """
-        # Check for pre-computed torsion data
-        if 'torsion_changes' in ligand_data and 'mask_rotate' in ligand_data:
-            result = {
-                'translation': ligand_data.get('translation', torch.zeros(3)),
-                'rotation': ligand_data.get('rotation', torch.zeros(3)),
-                'torsion_changes': ligand_data['torsion_changes'],
-                'mask_rotate': ligand_data['mask_rotate'],
-            }
-            if 'rotatable_edges' in ligand_data:
-                result['rotatable_edges'] = ligand_data['rotatable_edges']
-            return result
-
-        # Compute on-the-fly from coordinates
-        coords_x0 = ligand_data['coord']
-        coords_x1 = ligand_data['crystal_coord']
-
-        try:
-            from src.data.ligand_feat import (
-                compute_rigid_transform,
-                get_transformation_mask,
-                compute_torsion_angles_rdkit,
-            )
-
-            # Rigid body: translation + rotation
-            translation, rotation = compute_rigid_transform(coords_x0, coords_x1)
-
-            # Torsion: need edge_index from ligand data
-            edges = None
-            if 'edges' in ligand_data:
-                edges = ligand_data['edges']
-            elif 'edge' in ligand_data and 'edges' in ligand_data['edge']:
-                edges = ligand_data['edge']['edges']
-
-            if edges is None:
-                return {
-                    'translation': translation,
-                    'rotation': rotation,
-                    'torsion_changes': torch.zeros(0),
-                    'rotatable_edges': torch.zeros(0, 2, dtype=torch.long),
-                    'mask_rotate': torch.zeros(0, coords_x0.shape[0], dtype=torch.bool),
-                }
-
-            mask_rotate, rotatable_edge_indices = get_transformation_mask(
-                edges, coords_x0.shape[0]
-            )
-
-            if len(rotatable_edge_indices) == 0:
-                return {
-                    'translation': translation,
-                    'rotation': rotation,
-                    'torsion_changes': torch.zeros(0),
-                    'rotatable_edges': torch.zeros(0, 2, dtype=torch.long),
-                    'mask_rotate': torch.zeros(0, coords_x0.shape[0], dtype=torch.bool),
-                }
-
-            # Build rotatable_edges [M, 2] from edge indices
-            edges_np = edges.numpy() if torch.is_tensor(edges) else edges
-            rot_edges = torch.tensor(
-                [[int(edges_np[0, i]), int(edges_np[1, i])] for i in rotatable_edge_indices],
-                dtype=torch.long
-            )
-
-            # Compute torsion angle differences between x0 and x1
-            # We need RDKit mol for proper torsion computation, but as fallback
-            # compute approximate torsion changes from mask_rotate
-            # For now, store the mask and edge info; torsion targets computed in loss
-            mask_rot_filtered = mask_rotate[rotatable_edge_indices]  # [M, N]
-
-            return {
-                'translation': translation,
-                'rotation': rotation,
-                'torsion_changes': torch.zeros(len(rotatable_edge_indices)),  # Placeholder
-                'rotatable_edges': rot_edges,
-                'mask_rotate': mask_rot_filtered,
-            }
-
-        except Exception:
-            return None
 
     def _extract_coords(self, data: Any) -> torch.Tensor:
         """Extract 3D coordinates from data."""
@@ -552,76 +454,6 @@ class FlowFixDataset(Dataset):
         raise ValueError(f"Unsupported data format: {type(data)}")
 
 
-def _collate_torsion_data(
-    torsion_data_list: List[Optional[Dict[str, torch.Tensor]]],
-    ligand_batch,
-) -> Optional[Dict[str, torch.Tensor]]:
-    """
-    Collate torsion decomposition data across batch samples.
-
-    Handles variable number of rotatable bonds per molecule by concatenating
-    and adjusting atom indices with batch offsets.
-
-    Returns None if no torsion data is available.
-    """
-    valid = [td for td in torsion_data_list if td is not None]
-    if not valid:
-        return None
-
-    translations = []
-    rotations = []
-    torsion_changes = []
-    rotatable_edges = []
-    mask_rotate_list = []
-
-    total_atoms = ligand_batch.num_nodes
-    atom_counts = torch.bincount(ligand_batch.batch)
-    atom_offsets = torch.cat([torch.zeros(1, dtype=torch.long), atom_counts.cumsum(0)[:-1]])
-
-    for i, td in enumerate(torsion_data_list):
-        if td is None:
-            # No torsion data for this sample - add rigid body only
-            translations.append(torch.zeros(3))
-            rotations.append(torch.zeros(3))
-            continue
-
-        translations.append(td['translation'])
-        rotations.append(td['rotation'])
-
-        if td['torsion_changes'].numel() > 0:
-            torsion_changes.append(td['torsion_changes'])
-
-            # Offset rotatable edges by atom offset for this molecule
-            offset = atom_offsets[i].item()
-            edges = td['rotatable_edges'].clone()
-            edges = edges + offset
-            rotatable_edges.append(edges)
-
-            # Expand mask_rotate to full batch size
-            # td['mask_rotate']: [M_i, N_i] → need [M_i, N_total]
-            m_i = td['mask_rotate'].shape[0]
-            n_i = td['mask_rotate'].shape[1]
-            full_mask = torch.zeros(m_i, total_atoms, dtype=torch.bool)
-            full_mask[:, offset:offset + n_i] = td['mask_rotate']
-            mask_rotate_list.append(full_mask)
-
-    result = {
-        'translation': torch.stack(translations),  # [B, 3]
-        'rotation': torch.stack(rotations),          # [B, 3]
-    }
-
-    if torsion_changes:
-        result['torsion_changes'] = torch.cat(torsion_changes)  # [M_total]
-        result['rotatable_edges'] = torch.cat(rotatable_edges)  # [M_total, 2]
-        result['mask_rotate'] = torch.cat(mask_rotate_list)     # [M_total, N_total]
-    else:
-        result['torsion_changes'] = torch.zeros(0)
-        result['rotatable_edges'] = torch.zeros(0, 2, dtype=torch.long)
-        result['mask_rotate'] = torch.zeros(0, total_atoms, dtype=torch.bool)
-
-    return result
-
-
 def collate_flowfix_batch(samples: List[Dict]) -> Dict[str, Any]:
     """Batch FlowFix samples using PyG Batch."""
     # Filter out None samples (inconsistent atom counts)
@@ -667,10 +499,6 @@ def collate_flowfix_batch(samples: List[Dict]) -> Dict[str, Any]:
     else:
         distance_bounds_padded = None
 
-    # Collate torsion data if available
-    torsion_data_list = [s.get('torsion_data', None) for s in samples]
-    torsion_data_collated = _collate_torsion_data(torsion_data_list, ligand_batch)
-
     return {
         'pdb_ids': pdb_ids,
         'protein_graph': protein_batch,
@@ -678,8 +506,7 @@ def collate_flowfix_batch(samples: List[Dict]) -> Dict[str, Any]:
         'ligand_coords_x0': ligand_coords_x0,
         'ligand_coords_x1': ligand_coords_x1,
         'ligand_batch': ligand_batch.batch,  # PyG batch indices
-        'distance_bounds': distance_bounds_padded,
-        'torsion_data': torsion_data_collated,
+        'distance_bounds': distance_bounds_padded,  # {'lower': [B, N, N], 'upper': [B, N, N], 'num_atoms': [B]}
     }
 
 

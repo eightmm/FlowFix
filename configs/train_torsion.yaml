@@ -16,10 +16,10 @@ data:
     method: uniform
     num_timesteps_per_sample: 1
 
-# Model - SE(3) + Torsion output mode
+# Model
+# Uses ProteinLigandFlowMatchingTorsion (separate encoders + interaction + torsion heads)
+# Run with: python train_torsion.py --config configs/train_torsion.yaml
 model:
-  architecture: separate  # Uses ProteinLigandFlowMatching (separate encoders + interaction)
-  output_mode: torsion    # NEW: 'cartesian' (default) or 'torsion' (SE(3) + torsion decomposition)
 
   # Protein input dims
   protein_input_scalar_dim: 76

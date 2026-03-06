@@ -19,8 +19,6 @@ from src.utils.early_stop import EarlyStopping
 from src.utils.utils import set_random_seed
 from src.utils.visualization import MolecularVisualizer
 from src.utils.experiment import ExperimentManager
-from src.utils.losses import compute_se3_torsion_loss
-from src.utils.sampling import sample_trajectory_torsion, generate_timestep_schedule
 from src.utils.wandb_logger import (
     WandBLogger,
     extract_module_gradient_norms,
@@ -132,13 +130,9 @@ class FlowFixTrainer:
         # Build model
         self.model = build_model(model_config, self.device)
 
-        # Track output mode
-        self.output_mode = model_config.get('output_mode', 'cartesian')
-
         # Count parameters
         total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.exp_manager.logger.info(f"✓ Model initialized with {total_params:,} trainable parameters")
-        self.exp_manager.logger.info(f"  Output mode: {self.output_mode}")
 
     def setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -201,118 +195,10 @@ class FlowFixTrainer:
     def train_step(self, batch):
         """Single training step with flow matching.
 
-        Supports both 'cartesian' (per-atom velocity) and 'torsion' (SE(3)+torsion) modes.
+        Samples multiple timesteps per PDB system for more efficient training.
+        For each PDB system in the batch, we sample num_timesteps_per_sample different
+        timesteps and compute the loss across all of them.
         """
-        if self.output_mode == 'torsion':
-            return self._train_step_torsion(batch)
-        return self._train_step_cartesian(batch)
-
-    def _train_step_torsion(self, batch):
-        """Training step for SE(3) + Torsion decomposition mode."""
-        # Move to device
-        ligand_batch = batch['ligand_graph'].to(self.device)
-        protein_batch = batch['protein_graph'].to(self.device)
-        ligand_coords_x0 = batch['ligand_coords_x0'].to(self.device)
-        ligand_coords_x1 = batch['ligand_coords_x1'].to(self.device)
-        batch_size = len(batch['pdb_ids'])
-
-        # Sample timestep
-        t = torch.rand(batch_size, device=self.device)
-
-        # Linear interpolation: x_t = (1-t)*x0 + t*x1
-        t_expanded = t[ligand_batch.batch].unsqueeze(-1)
-        x_t = (1 - t_expanded) * ligand_coords_x0 + t_expanded * ligand_coords_x1
-
-        # Update ligand positions to x_t
-        ligand_batch_t = ligand_batch.clone()
-        ligand_batch_t.pos = x_t.clone()
-
-        # Collect torsion data from batch
-        torsion_data = batch.get('torsion_data')
-        if torsion_data is None:
-            # Fallback: no torsion data, compute rigid body only
-            from src.data.ligand_feat import compute_rigid_transform
-            translations, rotations = [], []
-            for b in range(batch_size):
-                mol_mask = (ligand_batch.batch == b)
-                x0_mol = ligand_coords_x0[mol_mask]
-                x1_mol = ligand_coords_x1[mol_mask]
-                trans, rot = compute_rigid_transform(x0_mol.cpu(), x1_mol.cpu())
-                translations.append(trans)
-                rotations.append(rot)
-            target = {
-                'translation': torch.stack(translations).to(self.device),
-                'rotation': torch.stack(rotations).to(self.device),
-                'torsion_changes': torch.zeros(0, device=self.device),
-            }
-            rotatable_edges = torch.zeros(0, 2, dtype=torch.long, device=self.device)
-            mask_rotate = torch.zeros(0, ligand_coords_x0.shape[0], dtype=torch.bool, device=self.device)
-        else:
-            target = {
-                'translation': torsion_data['translation'].to(self.device),
-                'rotation': torsion_data['rotation'].to(self.device),
-                'torsion_changes': torsion_data['torsion_changes'].to(self.device),
-            }
-            rotatable_edges = torsion_data['rotatable_edges'].to(self.device)
-            mask_rotate = torsion_data['mask_rotate'].to(self.device)
-
-        # Forward pass
-        pred = self.model(protein_batch, ligand_batch_t, t, rotatable_edges=rotatable_edges)
-
-        # Compute loss
-        loss_config = self.config['training'].get('torsion_loss', {})
-        losses = compute_se3_torsion_loss(
-            pred=pred,
-            target=target,
-            coords_x0=ligand_coords_x0,
-            coords_x1=ligand_coords_x1,
-            mask_rotate=mask_rotate,
-            rotatable_edges=rotatable_edges,
-            batch_indices=ligand_batch.batch,
-            w_trans=loss_config.get('w_trans', 1.0),
-            w_rot=loss_config.get('w_rot', 1.0),
-            w_tor=loss_config.get('w_tor', 1.0),
-            w_coord=loss_config.get('w_coord', 0.5),
-        )
-
-        loss = losses['total']
-
-        # Scale for gradient accumulation
-        gradient_accumulation_steps = self.config['training'].get('gradient_accumulation_steps', 1)
-        scaled_loss = loss / gradient_accumulation_steps
-        scaled_loss.backward()
-
-        if (self.global_step + 1) % gradient_accumulation_steps == 0:
-            if self.config['training'].get('gradient_clip'):
-                nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config['training']['gradient_clip']
-                )
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-        # RMSD for monitoring
-        with torch.no_grad():
-            rmsd = torch.sqrt(torch.mean((x_t - ligand_coords_x1) ** 2))
-
-        # Log gradient norms
-        if self.wandb_enabled:
-            if self.config.get('wandb', {}).get('log_gradients', True):
-                total_norm, module_norms = extract_module_gradient_norms(self.model)
-                self.wandb_logger.log_gradient_norms(total_norm, module_norms, self.global_step)
-
-        return {
-            'loss': loss.item(),
-            'rmsd': rmsd.item(),
-            'dg_loss': 0.0,
-            'loss_trans': losses['translation'].item(),
-            'loss_rot': losses['rotation'].item(),
-            'loss_tor': losses['torsion'].item(),
-            'loss_coord': losses['coord_recon'].item(),
-        }
-
-    def _train_step_cartesian(self, batch):
-        """Original training step with per-atom Cartesian velocity prediction."""
         # Get number of timesteps to sample per system
         num_timesteps = self.config['training'].get('num_timesteps_per_sample', 4)
 
@@ -519,20 +405,20 @@ class FlowFixTrainer:
         all_losses = []
         all_rmsds = []
         all_initial_rmsds = []
-
+        
         # For animation: track first sample
         viz_config = self.config.get('visualization', {})
         create_animation = viz_config.get('enabled', False) and viz_config.get('save_animation', True)
         animation_saved = False
         trajectory_coords = []
         trajectory_rmsds = []
-
+        
         # Randomly select which batch and sample to visualize (changes each epoch)
         if create_animation:
             num_val_batches = len(self.val_loader)
-            rng = np.random.RandomState(self.current_epoch)
+            rng = np.random.RandomState(self.current_epoch)  # Use epoch as seed for reproducibility
             target_batch_idx = rng.randint(0, num_val_batches)
-            print(f"\n Will visualize batch {target_batch_idx} (randomly selected for epoch {self.current_epoch})")
+            print(f"\n🎬 Will visualize batch {target_batch_idx} (randomly selected for epoch {self.current_epoch})")
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation")):
             # Move to device
@@ -545,100 +431,102 @@ class FlowFixTrainer:
             initial_rmsd = torch.sqrt(torch.mean((ligand_coords_x0 - ligand_coords_x1) ** 2, dim=-1))
             all_initial_rmsds.extend(initial_rmsd.cpu().numpy())
 
+            # Sample from docked to crystal using Euler/RK4 integration
             batch_size = len(batch['pdb_ids'])
             num_steps = self.config['sampling'].get('num_steps', 50)
+            method = self.config['sampling'].get('method', 'euler')
             schedule = self.config['sampling'].get('schedule', 'uniform')
 
-            timesteps = generate_timestep_schedule(num_steps, schedule, self.device)
+            # Generate timestep schedule
+            if schedule == 'uniform':
+                # Evenly spaced timesteps
+                timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
+            elif schedule == 'quadratic':
+                # Dense sampling near t=1 (crystal) - inverse quadratic
+                # Small dt at late times (t~1), large dt at early times (t~0)
+                timesteps = 1 - (1 - torch.linspace(0, 1, num_steps + 1, device=self.device)) ** 1.5
+            elif schedule == 'root':
+                # Alternative: root-based schedule (also dense at late)
+                timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device) ** (2/3)
+            elif schedule == 'sigmoid':
+                # Very dense sampling near t=1
+                raw = torch.linspace(-6, 6, num_steps + 1, device=self.device)
+                timesteps = torch.sigmoid(raw)
+            else:
+                # Default to uniform
+                timesteps = torch.linspace(0, 1, num_steps + 1, device=self.device)
 
-            # For animation tracking
+            current_coords = ligand_coords_x0.clone()
+            
+            # For randomly selected batch and sample: save trajectory for animation
             save_trajectory = (create_animation and not animation_saved and batch_idx == target_batch_idx)
-            trajectory_velocities = []
+            trajectory_velocities = []  # Store velocities for visualization
 
             if save_trajectory:
+                # Randomly select a sample from this batch
                 num_samples_in_batch = len(batch['pdb_ids'])
-                rng = np.random.RandomState(self.current_epoch + 1000)
+                rng = np.random.RandomState(self.current_epoch + 1000)  # Different seed for sample selection
                 target_sample_idx = rng.randint(0, num_samples_in_batch)
-                print(f"   Selected sample {target_sample_idx}/{num_samples_in_batch-1} (PDB: {batch['pdb_ids'][target_sample_idx]})")
+
+                print(f"   📍 Selected sample {target_sample_idx}/{num_samples_in_batch-1} (PDB: {batch['pdb_ids'][target_sample_idx]})")
+
+                # Get selected sample's ligand mask
                 sample_mask = (ligand_batch.batch == target_sample_idx)
-                trajectory_coords.append(ligand_coords_x0[sample_mask].clone())
-                init_rmsd_val = torch.sqrt(torch.mean(
-                    (ligand_coords_x0[sample_mask] - ligand_coords_x1[sample_mask]) ** 2
+                trajectory_coords.append(current_coords[sample_mask].clone())
+                # Calculate initial RMSD
+                initial_rmsd = torch.sqrt(torch.mean(
+                    (current_coords[sample_mask] - ligand_coords_x1[sample_mask]) ** 2
                 ))
-                trajectory_rmsds.append(init_rmsd_val.item())
+                trajectory_rmsds.append(initial_rmsd.item())
 
-            # --- SE(3) + Torsion sampling ---
-            if self.output_mode == 'torsion':
-                torsion_data = batch.get('torsion_data')
-                if torsion_data is not None:
-                    rotatable_edges = torsion_data['rotatable_edges'].to(self.device)
-                    mask_rotate = torsion_data['mask_rotate'].to(self.device)
-                else:
-                    rotatable_edges = torch.zeros(0, 2, dtype=torch.long, device=self.device)
-                    mask_rotate = torch.zeros(0, ligand_coords_x0.shape[0], dtype=torch.bool, device=self.device)
+            for step in range(num_steps):
+                t_current = timesteps[step]
+                t_next = timesteps[step + 1]
+                dt = t_next - t_current
 
-                result = sample_trajectory_torsion(
-                    model=self.model,
-                    protein_batch=protein_batch,
-                    ligand_batch=ligand_batch,
-                    x0=ligand_coords_x0,
-                    timesteps=timesteps,
-                    rotatable_edges=rotatable_edges,
-                    mask_rotate=mask_rotate,
-                    return_trajectory=save_trajectory,
-                )
-                refined_coords = result['final_coords']
+                # Broadcast t to batch size
+                t = torch.ones(batch_size, device=self.device) * t_current
 
-                if save_trajectory and 'trajectory' in result:
-                    for coords in result['trajectory']:
-                        if sample_mask is not None:
-                            trajectory_coords.append(coords[sample_mask].clone())
-                            step_rmsd = torch.sqrt(torch.mean(
-                                (coords[sample_mask] - ligand_coords_x1[sample_mask]) ** 2
-                            ))
-                            trajectory_rmsds.append(step_rmsd.item())
+                # Create batch with current coordinates
+                ligand_batch_t = ligand_batch.clone()
+                ligand_batch_t.pos = current_coords.clone()
 
-            # --- Cartesian sampling ---
-            else:
-                method = self.config['sampling'].get('method', 'euler')
-                current_coords = ligand_coords_x0.clone()
+                # Predict velocity
+                velocity = self.model(protein_batch, ligand_batch_t, t)
 
-                for step in range(num_steps):
-                    t_current = timesteps[step]
-                    t_next = timesteps[step + 1]
-                    dt = t_next - t_current
+                # Save velocity for visualization (before integration step)
+                if save_trajectory:
+                    trajectory_velocities.append(velocity[sample_mask].clone())
 
-                    t = torch.ones(batch_size, device=self.device) * t_current
+                if method == 'euler':
+                    # Euler step with variable dt
+                    current_coords = current_coords + dt * velocity
+                elif method == 'rk4':
+                    # RK4 integration with variable dt
+                    k1 = velocity
 
-                    ligand_batch_t = ligand_batch.clone()
-                    ligand_batch_t.pos = current_coords.clone()
+                    t_mid = t_current + 0.5 * dt
+                    ligand_batch_t.pos = (current_coords + 0.5 * dt * k1).clone()
+                    k2 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_mid)
 
-                    velocity = self.model(protein_batch, ligand_batch_t, t)
+                    ligand_batch_t.pos = (current_coords + 0.5 * dt * k2).clone()
+                    k3 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_mid)
 
-                    if save_trajectory:
-                        trajectory_velocities.append(velocity[sample_mask].clone())
+                    ligand_batch_t.pos = (current_coords + dt * k3).clone()
+                    k4 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_next)
 
-                    if method == 'euler':
-                        current_coords = current_coords + dt * velocity
-                    elif method == 'rk4':
-                        k1 = velocity
-                        t_mid = t_current + 0.5 * dt
-                        ligand_batch_t.pos = (current_coords + 0.5 * dt * k1).clone()
-                        k2 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_mid)
-                        ligand_batch_t.pos = (current_coords + 0.5 * dt * k2).clone()
-                        k3 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_mid)
-                        ligand_batch_t.pos = (current_coords + dt * k3).clone()
-                        k4 = self.model(protein_batch, ligand_batch_t, torch.ones(batch_size, device=self.device) * t_next)
-                        current_coords = current_coords + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+                    current_coords = current_coords + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
-                    if save_trajectory:
-                        trajectory_coords.append(current_coords[sample_mask].clone())
-                        step_rmsd = torch.sqrt(torch.mean(
-                            (current_coords[sample_mask] - ligand_coords_x1[sample_mask]) ** 2
-                        ))
-                        trajectory_rmsds.append(step_rmsd.item())
+                # Save trajectory for animation
+                if save_trajectory:
+                    trajectory_coords.append(current_coords[sample_mask].clone())
+                    # Calculate RMSD for this step
+                    step_rmsd = torch.sqrt(torch.mean(
+                        (current_coords[sample_mask] - ligand_coords_x1[sample_mask]) ** 2
+                    ))
+                    trajectory_rmsds.append(step_rmsd.item())
 
-                refined_coords = current_coords
+            refined_coords = current_coords
 
             # Calculate per-sample RMSD
             per_sample_rmsd = torch.sqrt(torch.mean((refined_coords - ligand_coords_x1) ** 2, dim=-1))
@@ -796,36 +684,22 @@ class FlowFixTrainer:
                 epoch_dg_losses.append(metrics['dg_loss'])
                 self.global_step += 1
 
-                postfix = {
+                pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
                     'rmsd': f"{metrics['rmsd']:.3f}",
-                }
-                if self.output_mode == 'torsion':
-                    postfix['tr'] = f"{metrics.get('loss_trans', 0):.3f}"
-                    postfix['rot'] = f"{metrics.get('loss_rot', 0):.3f}"
-                    postfix['tor'] = f"{metrics.get('loss_tor', 0):.3f}"
-                else:
-                    postfix['dg'] = f"{metrics['dg_loss']:.4f}"
-                pbar.set_postfix(postfix)
+                    'dg': f"{metrics['dg_loss']:.4f}"
+                })
 
                 # Log to WandB every 10 steps
                 if self.wandb_enabled and self.global_step % 10 == 0:
                     log_dict = {
                         'train/step_loss': metrics['loss'],
                         'train/step_rmsd': metrics['rmsd'],
+                        'train/step_dg_loss': metrics['dg_loss'],
                         'train/learning_rate': self.optimizer.param_groups[0]['lr'],
                         'meta/epoch': epoch,
                         'meta/step': self.global_step
                     }
-                    if self.output_mode == 'torsion':
-                        log_dict.update({
-                            'train/step_loss_trans': metrics.get('loss_trans', 0),
-                            'train/step_loss_rot': metrics.get('loss_rot', 0),
-                            'train/step_loss_tor': metrics.get('loss_tor', 0),
-                            'train/step_loss_coord': metrics.get('loss_coord', 0),
-                        })
-                    else:
-                        log_dict['train/step_dg_loss'] = metrics['dg_loss']
                     self.wandb_logger.log(log_dict)
 
             # Validation (skip epoch 0)
