@@ -15,12 +15,12 @@ SE(3)-equivariant message passing network 위에서 flow matching으로 velocity
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| Representation | Separate encoders + cross-attention | Protein/ligand feature type이 다름 (vector vs scalar) |
+| Representation | Joint protein-ligand graph | Cross-edge로 protein context 직접 전달 |
 | Equivariance | cuEquivariance tensor product | SE(3) symmetry 보존, GPU-accelerated |
-| Interaction | Pair-bias attention (cuEquivariance) | Long-range protein-ligand interaction |
+| Interaction | Direct message passing (no attention) | 단순하고 효율적인 protein-ligand interaction |
 | Generative model | Flow matching (rectified flow) | Stable training, fast sampling |
-| Protein embedding | ESMC 600M + ESM3 (weighted) | Pre-trained sequence representation |
-| Time conditioning | Implicit (in x_t coordinates) | Linear path에서 v = x1 - x0는 time-independent |
+| Protein embedding | ESMC 600M + ESM3 (weighted, gated) | Pre-trained sequence representation |
+| Optimizer | Muon + AdamW hybrid | 2D weight에 Muon, 나머지 AdamW |
 
 ---
 
@@ -91,46 +91,53 @@ Velocity field (orange arrows)를 따라 crystal structure 방향으로 이동.
 
 ```mermaid
 flowchart LR
-    subgraph enc["1. Encoding"]
-        P["Protein<br/>(scalar+vector)"] --> PN["ProteinNetwork<br/>3x GatingEquivLayer"]
-        L["Ligand<br/>(scalar only)"] --> LN["LigandNetwork<br/>3x GatingEquivLayer"]
-        ESM["ESMC+ESM3"] -.-> PN
+    subgraph prep["Preprocessing"]
+        P["Protein"] --> ESM["ESM Integration"]
+        T["time t"] --> TIME["Time Embedding"]
     end
 
-    subgraph int["2. Interaction"]
-        PN --> ATT["Pair-Bias Attention<br/>(2 layers, 8 heads)"]
-        LN --> ATT
+    subgraph joint["Joint Graph"]
+        ESM --> PPROJ["Protein Proj"]
+        L["Ligand"] --> LPROJ["Ligand Proj"]
+        PPROJ --> MERGE["Merge + 4 Edge Types"]
+        LPROJ --> MERGE
     end
 
-    subgraph vel["3. Velocity"]
-        ATT -->|"condition"| VEL["4x GatingEquivLayer<br/>+ AdaLN conditioning"]
-        LN -->|"features"| VEL
-        VEL --> V["v [N_l, 3]"]
+    subgraph mp["Message Passing"]
+        MERGE --> LAYERS["8x GatingEquivLayer<br/>+ Time AdaLN"]
+        TIME --> LAYERS
     end
 
-    style enc fill:#e8f5e9,stroke:#2E7D32
-    style int fill:#fff3e0,stroke:#E65100
-    style vel fill:#fce4ec,stroke:#C62828
+    subgraph out["Output"]
+        LAYERS --> EXT["Extract Ligand"]
+        EXT --> VEL["EquivariantMLP<br/>-> v [N_l, 3]"]
+    end
+
+    style prep fill:#e8f5e9,stroke:#2E7D32
+    style joint fill:#fff3e0,stroke:#E65100
+    style mp fill:#fce4ec,stroke:#C62828
+    style out fill:#f3e5f5,stroke:#6A1B9A
 ```
 
-**3-stage pipeline:**
-1. **Encoding**: Protein (SE(3)-equivariant, scalar+vector) / Ligand (scalar) 각각 별도 encoder
-2. **Interaction**: Equivariant -> scalar projection 후 pair-bias cross-attention
-3. **Velocity**: Protein global context + atom-wise interaction features로 conditioning된 equivariant velocity prediction
+**Joint graph architecture:**
+- Protein + ligand를 하나의 그래프로 합쳐서 **direct message passing** (cross-attention 없음)
+- 4 edge types: PP (pre-computed), LL bonds (pre-computed), LL intra (dynamic), PL cross (dynamic, 6.0A cutoff)
+- 8x GatingEquivariantLayer with time conditioning via AdaLN
+- Velocity output: ligand slice 추출 후 EquivariantMLP -> 3D velocity
 
 ### Training Setup
 
 | Parameter | Value |
 |-----------|-------|
-| Protein encoder | 3x GatingEquivariantLayer (128x0e + 32x1o + 32x1e) |
-| Ligand encoder | 3x GatingEquivariantLayer (128x0e + 16x1o + 16x1e) |
-| Interaction | 2x PairBiasAttention (256d, 8 heads, pair_dim=64) |
-| Velocity predictor | 4x GatingEquivariantLayer + EquivariantAdaLN conditioning |
-| Optimizer | Adam (lr=1e-4, eps=1e-8) |
-| Schedule | Cosine Annealing (min_lr=1e-6, epoch-based) |
-| Loss | Velocity MSE + Distance geometry loss (weight=0.1, time-aware) |
-| Timestep sampling | Logistic-Normal (mu=0.8, sigma=1.7, 98% mix with uniform) |
-| Gradient clipping | 1.0 |
+| Architecture | Joint graph (8x GatingEquivariantLayer) |
+| Hidden irreps | `192x0e + 48x1o + 48x1e` (480d) |
+| Edge cutoff (PL cross) | 6.0 A, max 16 neighbors |
+| Optimizer | Muon (lr=0.005) + AdamW (lr=3e-4) |
+| Schedule | Linear warmup (5%) + Plateau (80%) + Cosine decay (15%) |
+| Loss | Velocity MSE + Distance geometry loss (weight=0.1) |
+| EMA | decay=0.999 |
+| Batch size | 32 |
+| Epochs | 500 |
 | Dropout | 0.1 |
 
 ---
@@ -153,17 +160,12 @@ flowchart LR
 - 20-step Euler ODE with EMA model
 - Mean RMSD: 3.20A -> 2.64A, Success rate <2A: 30.4% -> 44.6%
 
-### 2025-03 - Separate Encoder + Cross-Attention Architecture
-- Joint graph -> separate protein/ligand encoders + pair-bias cross-attention 전환
-- Protein: scalar+vector features, Ligand: scalar-only features
-- 4-layer conditioned velocity prediction with EquivariantAdaLN
-- Implicit time conditioning (time info in x_t coordinates)
-- Adam optimizer로 단순화
-
-### 2025-02 - Joint Graph Architecture (deprecated)
-- Separate encoder + cross-attention -> joint protein-ligand graph 전환
-- cuEquivariance 기반 GatingEquivariantLayer (SE(3)-equivariant tensor product)
-- Muon + AdamW hybrid optimizer 도입
+### 2025-02 - Joint Graph Architecture (v4, current)
+- Joint protein-ligand graph with 4 edge types (PP, LL, LL intra, PL cross)
+- 8x GatingEquivariantLayer with time AdaLN conditioning
+- cuEquivariance tensor product for SE(3) equivariance
+- Muon + AdamW hybrid optimizer
+- EMA (decay=0.999) for inference
 
 ### 2024-11 - SE(3) + Torsion Decomposition
 - Translation [3D] + Rotation [3D] + Torsion [M] 분해 구현

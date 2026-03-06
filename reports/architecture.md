@@ -3,13 +3,15 @@
 > **SE(3)-Equivariant Flow Matching for Protein-Ligand Pose Refinement**
 >
 > Last updated: 2025-03-06
+>
+> Trained model: `rectified-flow-full-v4` (joint graph, 8-layer, ~13M params)
 
 ---
 
 ## 1. Overview
 
 FlowFix는 docking pose를 crystal structure로 refinement하는 SE(3)-equivariant flow matching 모델입니다.
-Linear interpolation path `x_t = (1-t)*x0 + t*x1`을 따라 per-atom velocity field `v(x_t)`를 학습합니다.
+Linear interpolation path `x_t = (1-t)*x0 + t*x1`을 따라 per-atom velocity field `v(x_t, t)`를 학습합니다.
 
 ### Pipeline Summary
 
@@ -19,30 +21,32 @@ flowchart LR
         X0["Docked Pose<br/>x_0 (t=0)"]
     end
 
-    subgraph model["FlowFix Model"]
+    subgraph model["FlowFix (Joint Graph)"]
         direction TB
-        ENC["Protein/Ligand<br/>Encoding"]
-        INT["Cross-Attention<br/>Interaction"]
+        PREP["ESM + Time<br/>Preprocessing"]
+        JOINT["Joint Graph<br/>8x Message Passing"]
         VEL["Velocity<br/>Prediction"]
-        ENC --> INT --> VEL
+        PREP --> JOINT --> VEL
     end
 
     subgraph output["Output"]
         X1["Refined Pose<br/>x_1 (t=1)"]
     end
 
-    X0 -->|"ODE Integration<br/>(Euler/RK4)"| model -->|"v(x_t)"| X1
+    X0 -->|"ODE Integration<br/>(20-step Euler)"| model -->|"v(x_t, t)"| X1
 ```
 
 ### Key Design Choices
 
-| Component | Previous (v4) | Current | Rationale |
-|-----------|--------------|---------|-----------|
-| Graph structure | Joint protein-ligand graph | Separate encoders + cross-attention | Protein/ligand feature type이 다름 (vector vs scalar) |
-| Interaction | Message passing on joint graph | Pair-bias attention (cuEquivariance) | 더 expressive한 long-range interaction |
-| Time conditioning | Explicit sinusoidal embedding | Implicit (x_t coordinates) | Linear path에서 v = x1 - x0는 time-independent |
-| Optimizer | Muon + AdamW hybrid | Adam | 단순화 |
-| Velocity output | Single equivariant MLP | 4-layer conditioned GatingEquivariantLayer | Richer conditioning with protein context |
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| Graph structure | Joint protein-ligand graph | Cross-edge로 protein context 직접 전달 |
+| Equivariance | cuEquivariance tensor product | SE(3) symmetry 보존, GPU-accelerated |
+| Interaction | Direct message passing (no attention) | 단순하고 효율적인 protein-ligand interaction |
+| Time conditioning | Explicit sinusoidal + AdaLN | 각 layer에서 time-aware feature modulation |
+| Optimizer | Muon + AdamW hybrid | 2D weight matrix에 Muon, 나머지 AdamW |
+| Generative model | Flow matching (rectified flow) | Stable training, fast sampling |
+| Protein embedding | ESMC 600M + ESM3 (weighted) | Pre-trained sequence representation |
 
 ---
 
@@ -52,114 +56,97 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph stage1["Stage 1: Feature Encoding"]
-        direction TB
+    subgraph stage1["Preprocessing"]
         P["Protein Graph<br/>scalar: 76d, vector: 31x3d<br/>edge scalar: 39d, edge vector: 8x3d"]
-        L["Ligand Graph<br/>scalar: 121d<br/>edge: 44d"]
+        L["Ligand Graph<br/>scalar: 122d<br/>edge: 44d"]
+        T["timestep t"]
 
-        ESM["ESM Integration<br/>ESMC 600M (1152d) + ESM3 (1536d)<br/>learnable weighted sum<br/>residual add to protein.x"]
+        ESM["ESM Integration<br/>ESMC 600M (1152d) + ESM3 (1536d)<br/>softmax weighted sum<br/>gated concat to protein.x"]
 
-        PN["ProteinNetwork<br/>UnifiedEquivariantNetwork<br/>EquivMLP + 3x GatingEquivLayer<br/>Output: 128x0e + 32x1o + 32x1e"]
+        TIME["Time Embedding<br/>sinusoidal -> MLP<br/>-> condition [B, 384]"]
 
-        LN["LigandNetwork<br/>UnifiedEquivariantNetwork<br/>EquivMLP + 3x GatingEquivLayer<br/>Output: 128x0e + 16x1o + 16x1e"]
-
-        P --> ESM --> PN
-        L --> LN
+        P --> ESM
+        T --> TIME
     end
 
-    subgraph stage2["Stage 2: Protein-Ligand Interaction"]
-        direction TB
-        PROJ["Equivariant -> Scalar Projection<br/>EquivariantMLP per type<br/>-> 256d scalars"]
+    subgraph stage2["Joint Graph Construction"]
+        PPROJ["protein_node_proj<br/>EquivariantMLP<br/>-> 192x0e + 48x1o + 48x1e"]
+        LPROJ["ligand_node_proj<br/>EquivariantMLP<br/>-> 192x0e + 48x1o + 48x1e"]
 
-        PAIR["Pair Bias Features<br/>32 RBF + 3 interaction types<br/>+ inv_dist + norm_dist + mask<br/>MLP -> 64d"]
+        EDGES["4 Edge Types<br/>PP: pre-computed protein edges<br/>LL: pre-computed ligand bonds<br/>LL intra: dynamic radius graph<br/>PL cross: dynamic radius graph<br/>(cutoff=6.0A, max_neighbors=16)"]
 
-        ATT["2x Pair-Bias Attention Block<br/>8 heads, pair_dim=64<br/>cuequivariance attention_pair_bias<br/>+ FFN (256->512->256) + LayerNorm"]
+        MERGE["Joint Graph<br/>joint_h = cat(prot_h, lig_h)<br/>+ merged edge_index"]
 
-        POOL["Output<br/>lig_out: [N_l, 256] atom-wise<br/>prot_global: [B, 512] mean+std pool"]
-
-        PROJ --> PAIR --> ATT --> POOL
+        ESM --> PPROJ --> MERGE
+        L --> LPROJ --> MERGE
+        EDGES --> MERGE
     end
 
-    subgraph stage3["Stage 3: Velocity Prediction"]
-        direction TB
-        COND["Condition Assembly<br/>protein_global [B,512]<br/>+ lig_out [N_l,256]<br/>-> MLP -> atom_condition [N_l,256]"]
-
-        VINP["Input: EquivariantMLP<br/>ligand_output -> vel_hidden_irreps"]
-
-        VBLK["4x GatingEquivariantLayer<br/>with EquivariantAdaLN conditioning<br/>(input + output conditioning)"]
-
-        VOUT["Output: EquivariantMLP (3-layer)<br/>vel_hidden -> 1x1o (3D vector)<br/>zero-init, scale=0.1"]
-
-        COND --> VBLK
-        VINP --> VBLK --> VOUT
+    subgraph stage3["Message Passing (x8)"]
+        LAYER["GatingEquivariantLayer<br/>pre_norm -> AdaLN(time)<br/>-> TensorProduct message<br/>-> scalar/vector gating<br/>-> scatter sum + self-interaction<br/>-> node_update -> post_adaln(time)<br/>-> gated skip connection"]
     end
 
-    PN --> PROJ
-    LN --> PROJ
-    LN -->|"ligand_output"| VINP
-    ATT -->|"lig_out"| COND
-    POOL -->|"prot_global"| COND
-
-    subgraph out["Output"]
-        V["Velocity: [N_ligand, 3]<br/>per-atom displacement vector"]
+    subgraph stage4["Velocity Output"]
+        EXTRACT["Extract ligand nodes<br/>joint_h[N_p:]"]
+        VOUT["velocity_output<br/>EquivariantMLP (2-layer)<br/>hidden_irreps -> 1x1o (3D)"]
+        V["velocity [N_ligand, 3]"]
     end
 
-    VOUT --> V
+    TIME --> LAYER
+    MERGE --> LAYER
+    LAYER --> EXTRACT --> VOUT --> V
 
     style stage1 fill:#e8f5e9,stroke:#2E7D32
     style stage2 fill:#fff3e0,stroke:#E65100
     style stage3 fill:#fce4ec,stroke:#C62828
-    style out fill:#f3e5f5,stroke:#6A1B9A
+    style stage4 fill:#f3e5f5,stroke:#6A1B9A
 ```
 
 ---
 
 ### 2.2 GatingEquivariantLayer (Core Block)
 
-모든 equivariant processing의 기본 단위. Protein encoder, ligand encoder, velocity predictor 모두에서 사용.
+8번 반복되는 SE(3)-equivariant message passing layer. Joint graph의 모든 node (protein + ligand) 위에서 동작.
 
 ```mermaid
 flowchart TB
     subgraph input["Input"]
         H["node_features [N, irreps]"]
-        C["condition [N, D]<br/>(velocity blocks only)"]
+        TC["time_condition [N, 384]"]
     end
 
-    ADALN1["Input EquivariantAdaLN<br/>scalar: LayerNorm + scale/bias from condition<br/>vector: norm-based gating from condition"]
+    PRE["pre_norm (BatchNorm)"]
+    ADALN1["context_adaln<br/>scalar: LN + scale/bias from time<br/>vector: norm-based gating"]
 
     subgraph mp["Message Passing"]
-        SH["Spherical Harmonics Y_l(r_ij)<br/>l = 0, 1, 2"]
-        EDGE["Edge Embedding<br/>MLP(edge_attr) -> hidden"]
-        TP["Tensor Product<br/>node[src] x (edge_emb, edge_sh)"]
-        MSG["Message MLP"]
-        IMP["Edge Importance<br/>sigmoid(MLP(src, dst, edge))"]
-        SG["Scalar Gate<br/>sigmoid(MLP(edge_emb))"]
-        VG["Vector Gate<br/>norm features -> sigmoid(MLP)"]
-        AGG["Scatter Sum<br/>[E] -> [N]"]
+        SH["Spherical Harmonics<br/>Y_l(r_ij), l=0,1,2"]
+        EDGE["edge_embedding<br/>MLP(edge_attr)"]
+        TP["tp_message<br/>TensorProduct<br/>node[src] x (edge_emb, SH)"]
+        MSG["message_mlp"]
+        NP["node_pair_proj<br/>(edge importance)"]
+        SG["scalar_gate_net<br/>sigmoid"]
+        VG["vector_gate_net<br/>norm-based sigmoid"]
+        AGG["Scatter Sum"]
     end
 
-    SELF["Self-Interaction<br/>TensorProduct(node, ones)"]
+    SELF["tp_self<br/>TensorProduct(node, ones)"]
 
-    ADD["Sum: aggregated + self_update"]
-    NMLP["Node Update EquivariantMLP"]
-    BN["Equivariant BatchNorm"]
-    ADALN2["Output EquivariantAdaLN"]
-    SKIP["Skip Connection: output + identity"]
+    ADD["aggregated + self_update"]
+    NMLP["node_update_mlp"]
+    ADALN2["post_adaln<br/>Time-conditioned AdaLN"]
+    SKIP["skip_gate<br/>gate * update + (1-gate) * identity"]
 
-    H --> ADALN1
-    C --> ADALN1
-    ADALN1 --> TP
-    ADALN1 --> SELF
+    H --> PRE --> ADALN1
+    TC --> ADALN1
+    ADALN1 --> TP --> MSG --> NP --> SG --> VG --> AGG --> ADD
+    ADALN1 --> SELF --> ADD
     SH --> TP
     EDGE --> TP
-    TP --> MSG --> IMP --> SG --> VG --> AGG
-    AGG --> ADD
-    SELF --> ADD
-    ADD --> NMLP --> BN --> ADALN2 --> SKIP
-    C --> ADALN2
+    ADD --> NMLP --> ADALN2 --> SKIP
+    TC --> ADALN2
 
     subgraph output["Output"]
-        OUT["updated node_features [N, irreps]"]
+        OUT["updated features [N, irreps]"]
     end
     SKIP --> OUT
 
@@ -168,93 +155,47 @@ flowchart TB
 
 **핵심 특징:**
 - **Tensor Product**: `cuequivariance_torch.FullyConnectedTensorProduct`로 SE(3) equivariance 보존
-- **Dual Gating**: Scalar gate (element-wise) + Vector gate (norm-based adaptive)
-- **Edge Importance**: 학습 가능한 message-level attention weight
-- **Dual AdaLN**: Input/Output 양쪽에서 context conditioning (velocity blocks에서만)
+- **Dual Gating**: Scalar gate (element-wise sigmoid) + Vector gate (norm-based adaptive sigmoid)
+- **Edge Importance**: src/dst scalar features로 학습 가능한 message weight
+- **Dual AdaLN**: Input/Output 양쪽에서 time conditioning
+- **Gated Skip**: 학습 가능한 gate로 identity와 update 비율 결정
 
 ---
 
-### 2.3 Cross-Attention Interaction
+### 2.3 ESM Embedding Integration
 
-Protein-ligand 간 상호작용을 pair-bias attention으로 모델링.
-
-```mermaid
-flowchart TB
-    subgraph input["Inputs"]
-        PF["Protein features<br/>128x0e + 32x1o + 32x1e"]
-        LF["Ligand features<br/>128x0e + 16x1o + 16x1e"]
-    end
-
-    subgraph proj["Equivariant -> Scalar"]
-        P2S["EquivariantMLP<br/>-> 256d scalars"]
-        L2S["EquivariantMLP<br/>-> 256d scalars"]
-    end
-
-    subgraph seq["Sequence Format"]
-        PAD["PyG -> Padded [B, N, D]<br/>Dynamic padding"]
-        CAT["Concatenate<br/>[B, N_p+N_l, 256]"]
-    end
-
-    subgraph pair["Pair Bias [B, N, N, 64]"]
-        RBF["32 Gaussian RBF<br/>centers: 0-20A, width: 2.5A"]
-        TYPE["3 Interaction type flags<br/>PP / PL / LL"]
-        EXTRA["inv_dist + norm_dist + mask"]
-        PMLP["MLP: 38 -> 64 -> 64"]
-    end
-
-    subgraph attn["Attention Stack (x2)"]
-        direction TB
-        QKV["QKV Projection (no bias)<br/>[B, N, 256] -> [B, H, N, 32] x 3"]
-        APB["cuequivariance attention_pair_bias<br/>8 heads + pair bias gating"]
-        LN1["LayerNorm + Dropout + Residual"]
-        FFN["FFN: 256 -> 512 (SiLU) -> 256"]
-        LN2["LayerNorm + Dropout + Residual"]
-        QKV --> APB --> LN1 --> FFN --> LN2
-    end
-
-    GSKIP["Global Skip: h + h_initial"]
-
-    subgraph output["Outputs"]
-        LO["lig_out [N_l, 256]<br/>atom-wise interaction features"]
-        PG["prot_global [B, 512]<br/>mean + std pooling"]
-    end
-
-    PF --> P2S --> PAD
-    LF --> L2S --> PAD
-    PAD --> CAT --> attn
-    RBF --> PMLP
-    TYPE --> PMLP
-    EXTRA --> PMLP
-    PMLP --> attn
-    attn --> GSKIP --> output
-
-    style pair fill:#fff3e0,stroke:#E65100
-    style attn fill:#e3f2fd,stroke:#1565C0
-```
-
----
-
-### 2.4 ESM Embedding Integration
-
-Pre-trained protein language model (PLM)의 residue-level embedding을 protein features에 통합.
+Pre-trained PLM의 residue-level embedding을 protein features에 통합.
 
 ```mermaid
 flowchart LR
     ESMC["ESMC 600M<br/>[N, 1152]"] --> P1["MLP<br/>1152->128->128"]
     ESM3["ESM3<br/>[N, 1536]"] --> P2["MLP<br/>1536->128->128"]
 
-    P1 --> WS["Weighted Sum<br/>softmax(w) * proj"]
+    P1 --> WS["Weighted Sum<br/>softmax(esm_weight)"]
     P2 --> WS
 
-    WS --> B2I["MLP: 128->76"]
-    PX["protein.x [N,76]"] --> ADD["Residual Add"]
-    B2I --> ADD
-    ADD --> OUT["enhanced protein.x [N,76]"]
+    WS --> GATE["esm_gate<br/>sigmoid MLP"]
+
+    PX["protein.x [N,76]"] --> CAT["Gated Concat"]
+    GATE --> CAT
+    CAT --> OUT["[N, 76+128]"]
 ```
 
-- ESMC와 ESM3의 가중치는 학습 가능한 파라미터 (`nn.Parameter`)
-- Softmax로 정규화 후 weighted sum
-- 원래 protein feature에 residual connection으로 추가
+- ESM weight: learnable `nn.Parameter`, softmax 정규화
+- Gated concatenation: sigmoid gate로 ESM feature 영향도 학습
+
+---
+
+### 2.4 Time Conditioning
+
+```mermaid
+flowchart LR
+    T["t [B]"] --> SIN["Sinusoidal<br/>sin/cos"]
+    SIN --> TE["time_embedding<br/>MLP: D->4D->D"]
+    TE --> TC["time_to_condition<br/>MLP -> 384d"]
+    TC --> EXP["Expand<br/>[B,384] -> [N,384]"]
+    EXP --> L["AdaLN in<br/>each of 8 layers"]
+```
 
 ---
 
@@ -264,217 +205,159 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    subgraph sampling["Timestep Sampling"]
-        TS["Logistic-Normal<br/>mu=0.8, sigma=1.7<br/>mix_ratio=0.98 with uniform"]
-    end
-
-    subgraph interpolation["Linear Interpolation"]
+    subgraph sample["Sampling"]
         X0["x_0 (docked)"]
         X1["x_1 (crystal)"]
-        XT["x_t = (1-t)*x_0 + t*x_1"]
+        T["t ~ Uniform(0,1)"]
     end
 
-    subgraph loss["Loss Computation"]
-        VP["v_pred = model(protein, ligand_t, t)"]
-        VT["v_true = x_1 - x_0<br/>(constant for linear path)"]
-        MSE["L_flow = MSE(v_pred, v_true)"]
-        DG["L_dg = distance geometry<br/>bond length/angle constraints<br/>time-weighted (stronger near t=1)"]
-        TOTAL["L_total = L_flow + w * L_dg"]
-    end
+    INTERP["x_t = (1-t)*x0 + t*x1"]
+    FWD["v_pred = model(prot, lig_t, t)"]
+    VT["v_true = x1 - x0"]
+    MSE["L_flow = MSE(v_pred, v_true)"]
+    DG["L_dg = dist geometry<br/>bond constraints<br/>time-weighted"]
+    TOTAL["L = L_flow + 0.1 * L_dg"]
 
-    TS --> XT
-    X0 --> XT
-    X1 --> XT
-    XT --> VP --> MSE --> TOTAL
+    X0 --> INTERP
+    X1 --> INTERP
+    T --> INTERP
+    INTERP --> FWD --> MSE --> TOTAL
     VT --> MSE
     DG --> TOTAL
 ```
-
-**Multi-timestep training**: 각 PDB system에 대해 `num_timesteps_per_sample`개의 서로 다른 timestep에서 loss 계산.
-이를 위해 batch를 replicate하여 효율적으로 처리.
 
 ### 3.2 Training Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| Optimizer | Adam (lr=1e-4, eps=1e-8) |
-| Scheduler | Cosine Annealing (min_lr=1e-6, epoch-based) |
-| Gradient clipping | 1.0 |
-| Batch size | config-dependent |
-| Gradient accumulation | configurable |
-| Distance geometry weight | 0.1 |
+| Architecture | Joint graph (8 layers) |
+| Hidden (scalar/vector) | 192 / 48 |
+| Hidden irreps | `192x0e + 48x1o + 48x1e` (480d) |
+| Edge cutoff | 6.0 A, max 16 neighbors |
+| Optimizer | Muon (lr=0.005) + AdamW (lr=3e-4) |
+| Schedule | Warmup 5% + Plateau 80% + Cosine 15% |
+| Loss | Velocity MSE + DG loss (weight=0.1) |
+| EMA | decay=0.999 (inference에 사용) |
+| Batch size | 32 |
+| Epochs | 500 |
 | Dropout | 0.1 |
-| Early stopping | patience=50 on success rate <2A |
+| ODE sampling | 20-step Euler, uniform schedule |
 
-### 3.3 ODE Sampling (Inference/Validation)
+### 3.3 ODE Sampling (Inference)
 
 ```mermaid
 flowchart LR
-    X0["x_0<br/>(docked)"] --> LOOP
+    X0["x_0 (docked)"] --> LOOP
 
-    subgraph LOOP["ODE Integration (N steps)"]
+    subgraph LOOP["Euler Integration (20 steps)"]
         direction TB
-        T["t_i -> t_{i+1}"]
-        V["v = model(protein, ligand_{t_i}, t_i)"]
-        EU["Euler: x += dt * v"]
-        RK["RK4: 4-stage weighted average"]
-        T --> V
-        V --> EU
-        V --> RK
+        V["v = model(prot, lig_t, t_i)"]
+        U["x += dt * v"]
+        V --> U
     end
 
-    LOOP --> X1["x_1<br/>(refined)"]
+    LOOP --> X1["x_1 (refined)"]
+    X1 --> M["RMSD<br/>Success Rate"]
 ```
-
-**Timestep schedules:**
-- `uniform`: 등간격
-- `quadratic`: t=1 근처에서 dense (1-(1-t)^1.5)
-- `root`: t^(2/3)
-- `sigmoid`: 양 끝점 근처에서 dense
 
 ---
 
 ## 4. Dimension Reference
 
-### Feature Dimensions
-
 ```
 Protein:
-  Node scalar:  76  ─┐
-  Node vector:  31x3 ├─> UnifiedEquivNet ──> 128x0e + 32x1o + 32x1e (320d)
-  Edge scalar:  39   │
-  Edge vector:  8x3  ┘
+  Node scalar:  76   ─┐
+  Node vector:  31x3  │  + ESM 128d (gated concat)
+  Edge scalar:  39    ├─> protein_node_proj ──> 192x0e + 48x1o + 48x1e
+  Edge vector:  8x3   ┘
 
 Ligand:
-  Node scalar:  121 ─┐
-  Edge scalar:  44   ├─> UnifiedEquivNet ──> 128x0e + 16x1o + 16x1e (224d)
+  Node scalar:  122 ─┐
+  Edge scalar:  44   ├─> ligand_node_proj ──> 192x0e + 48x1o + 48x1e
                      ┘
 
-Interaction:
-  Input:   320d (protein) + 224d (ligand)
-  Hidden:  256d (scalar only, after equivariant projection)
-  Pair:    64d (RBF + type features)
-  Output:  256d per atom (ligand), 512d global (protein mean+std)
+Joint Graph:
+  Nodes:  N_p + N_l, each 480d (hidden_irreps)
+  Edges:  PP + LL + LL_intra + PL_cross, each 192d
+  Time:   384d condition via AdaLN
 
-Velocity:
-  Input:   224d (ligand irreps)
-  Hidden:  128x0e + 16x1o + 16x1e (224d)
-  Condition: 256d (protein_global 512 + lig_out 256 -> MLP -> 256)
-  Output:  1x1o = 3d (velocity vector per atom)
+Output:
+  Velocity: 1x1o = 3d per ligand atom
 ```
 
-### Irreps Notation Quick Reference
+### Irreps Quick Reference
 
-| Symbol | Meaning | Dimension |
-|--------|---------|-----------|
-| `Nx0e` | N scalar channels (even parity) | N |
-| `Nx1o` | N true vector channels (odd parity) | N x 3 |
-| `Nx1e` | N pseudo-vector channels (even parity) | N x 3 |
+| Symbol | Meaning | Flat dim |
+|--------|---------|----------|
+| `192x0e` | 192 scalars (even parity) | 192 |
+| `48x1o` | 48 true vectors (odd parity) | 144 |
+| `48x1e` | 48 pseudo-vectors (even parity) | 144 |
+| Total hidden | `192x0e + 48x1o + 48x1e` | 480 |
 
 ---
 
-## 5. Module Dependency
+## 5. Module Structure (from checkpoint)
 
-```mermaid
-graph TD
-    FM["ProteinLigandFlowMatching<br/>src/models/flowmatching.py"]
+```
+Top-level:
+  esm_weight                    # [2] learnable ESMC/ESM3 weights
+  esmc_projection               # MLP: 1152 -> 128
+  esm3_projection               # MLP: 1536 -> 128
+  esm_gate                      # MLP: 128 -> 128 (sigmoid)
+  time_embedding                # Sinusoidal + MLP
+  time_to_condition             # MLP -> 384d
 
-    PN["UnifiedEquivariantNetwork<br/>(Protein Encoder)"]
-    LN["UnifiedEquivariantNetwork<br/>(Ligand Encoder)"]
-    IN["ProteinLigandInteractionNetwork"]
+  joint_network/
+    protein_node_proj           # EquivariantMLP
+    ligand_node_proj            # EquivariantMLP
+    pp_edge_proj                # EquivariantMLP (protein edges)
+    ll_edge_proj                # MLP (ligand bond edges)
+    dynamic_edge_proj           # MLP (PL cross + LL intra)
 
-    FM --> PN
-    FM --> LN
-    FM --> IN
+    layers[0..7]/               # 8x GatingEquivariantLayer
+      pre_norm                  #   EquivariantBatchNorm
+      context_adaln             #   Time AdaLN (input)
+      edge_embedding            #   MLP
+      tp_message                #   TensorProduct (message)
+      message_mlp               #   EquivariantMLP
+      node_pair_proj            #   Edge importance
+      scalar_gate_net           #   Scalar gating
+      vector_norm_net           #   Vector norm features
+      vector_gate_net           #   Vector gating
+      tp_self                   #   TensorProduct (self)
+      node_update_mlp           #   EquivariantMLP
+      post_adaln                #   Time AdaLN (output)
+      skip_gate                 #   Learnable skip
+      rbf_centers, rbf_width    #   RBF params
 
-    subgraph network["src/models/network.py"]
-        PN
-        LN
-        IN
-    end
-
-    subgraph cue["src/models/cue_layers.py"]
-        GEL["GatingEquivariantLayer"]
-        EMLP["EquivariantMLP"]
-        PBA["PairBiasAttentionLayer"]
-        ADALN_E["EquivariantAdaLN"]
-    end
-
-    subgraph torch_l["src/models/torch_layers.py"]
-        MLP["MLP"]
-        ADALN["AdaLN"]
-        CTB["ConditionedTransitionBlock"]
-    end
-
-    subgraph nvidia["cuequivariance_torch (NVIDIA)"]
-        CUE_TP["FullyConnectedTensorProduct"]
-        CUE_SH["SphericalHarmonics"]
-        CUE_LIN["Linear"]
-        CUE_ATT["attention_pair_bias"]
-    end
-
-    PN --> GEL
-    PN --> EMLP
-    LN --> GEL
-    LN --> EMLP
-    IN --> EMLP
-    IN --> PBA
-    IN --> MLP
-    FM --> GEL
-    FM --> EMLP
-    FM --> MLP
-
-    GEL --> CUE_TP
-    GEL --> CUE_SH
-    GEL --> ADALN_E
-    GEL --> MLP
-    EMLP --> CUE_LIN
-    PBA --> CUE_ATT
-
-    style FM fill:#ffcdd2,stroke:#B71C1C
-    style nvidia fill:#bbdefb,stroke:#0D47A1
-    style cue fill:#c8e6c9,stroke:#1B5E20
-    style torch_l fill:#fff9c4,stroke:#F57F17
+    velocity_output             # EquivariantMLP -> 1x1o
 ```
 
----
-
-## 6. Parameter Count Breakdown
-
-| Module | Approx. Parameters | Role |
-|--------|-------------------|------|
-| ProteinNetwork | ~1.5M | Protein structure encoding |
-| LigandNetwork | ~1.0M | Ligand structure encoding |
-| ESM Projections | ~0.5M | PLM embedding integration |
-| InteractionNetwork | ~2.5M | Cross-attention + pair bias |
-| Velocity Blocks (x4) | ~3.0M | Conditioned velocity prediction |
-| Velocity I/O MLPs | ~0.5M | Input/output projections |
-| **Total** | **~9M** | |
-
-> 정확한 수치는 config에 따라 다름. `train.py` 실행 시 출력됨.
+**716 parameter tensors, ~13M trainable parameters**
 
 ---
 
-## 7. File Map
+## 6. File Map
 
 ```
 src/models/
-  flowmatching.py    ProteinLigandFlowMatching (top-level)
-  network.py         UnifiedEquivariantNetwork, ProteinLigandInteractionNetwork
-  cue_layers.py      GatingEquivariantLayer, EquivariantMLP, PairBiasAttention, ...
+  flowmatching.py    Model definitions
+  network.py         Network components
+  cue_layers.py      GatingEquivariantLayer, EquivariantMLP, ...
   torch_layers.py    MLP, AdaLN, SwiGLU, TimeEmbedding, ...
 
 src/data/
-  dataset.py         FlowFixDataset (lazy/hybrid/preload)
-  protein_feat.py    Protein featurization + ESM
-  ligand_feat.py     Ligand featurization
+  dataset.py         FlowFixDataset
 
 src/utils/
   losses.py          Distance geometry loss, clash loss
   sampling.py        ODE integration, timestep schedules
-  training_utils.py  Optimizer, scheduler builders
   model_builder.py   Config -> model construction
 
-train.py             Training loop (FlowFixTrainer)
+configs/
+  train_rectified_flow_full.yaml   # v4 config (trained model)
+  train_joint.yaml                 # Joint architecture template
+
+train.py             Training loop
 inference.py         Inference script
 ```
