@@ -310,7 +310,7 @@ def run_batched_inference(model, dataloader, num_steps, device, output_path):
 
 def main():
     p = argparse.ArgumentParser(description="Full validation inference")
-    p.add_argument("--config", default="configs/train_joint.yaml")
+    p.add_argument("--config", default="configs/train.yaml")
     p.add_argument("--checkpoint", default="save/rectified-flow-full-v4/checkpoints/latest.pt")
     p.add_argument("--output", default="inference_results/full_validation_results.json")
     p.add_argument("--no_ema", action="store_true")

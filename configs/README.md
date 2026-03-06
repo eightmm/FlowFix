@@ -4,10 +4,14 @@
 
 ## 파일 목록
 
-- `train_joint.yaml`
-  - **학습 설정** (joint protein-ligand graph 아키텍처)
-  - Slurm 스크립트 `scripts/slurm/run_train_joint*.sh`에서 기본으로 사용합니다.
+- `train.yaml`
+  - **Cartesian 학습 설정** (per-atom velocity field)
+  - Slurm 스크립트 `scripts/slurm/run_train_full.sh`에서 기본으로 사용합니다.
   - 추론 시에도 이 설정을 기반으로 모델을 로드합니다.
+
+- `train_torsion.yaml`
+  - **SE(3) + Torsion 학습 설정** (translation + rotation + torsion)
+  - `train_torsion.py`에서 사용합니다.
 
 ## 공통 구조(개요)
 
@@ -34,21 +38,21 @@
 ### 학습 (로컬)
 
 ```bash
-python train.py --config configs/train_joint.yaml
+python train.py --config configs/train.yaml
 ```
 
 ### 멀티 GPU 학습 (DDP, 로컬/서버)
 
 ```bash
 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=8 \
-  train.py --config configs/train_joint.yaml
+  train.py --config configs/train.yaml
 ```
 
 ### 추론/평가
 
 ```bash
 python inference.py \
-  --config configs/train_joint.yaml \
+  --config configs/train.yaml \
   --checkpoint /path/to/checkpoint.pt \
   --device cuda
 ```

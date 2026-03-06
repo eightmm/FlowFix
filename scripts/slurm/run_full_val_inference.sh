@@ -42,7 +42,7 @@ fi
 
 echo "Starting full validation inference (200 val PDBs, all poses)..."
 $PYTHON -u scripts/analysis/infer_full_validation.py \
-    --config configs/train_joint.yaml \
+    --config configs/train.yaml \
     --checkpoint "$CHECKPOINT" \
     --output "$OUTPUT"
 

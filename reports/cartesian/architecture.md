@@ -167,14 +167,14 @@ flowchart TB
 Pre-trained PLM의 residue-level embedding을 protein features에 통합.
 
 ```mermaid
-flowchart LR
-    ESMC["ESMC 600M<br/>[N, 1152]"] --> P1["MLP<br/>1152->128->128"]
-    ESM3["ESM3<br/>[N, 1536]"] --> P2["MLP<br/>1536->128->128"]
+flowchart TB
+    ESMC["ESMC 600M [N, 1152]"] --> P1["MLP 1152->128->128"]
+    ESM3["ESM3 [N, 1536]"] --> P2["MLP 1536->128->128"]
 
     P1 --> WS["Weighted Sum<br/>softmax(esm_weight)"]
     P2 --> WS
 
-    WS --> GATE["esm_gate<br/>sigmoid MLP"]
+    WS --> GATE["esm_gate (sigmoid MLP)"]
 
     PX["protein.x [N,76]"] --> CAT["Gated Concat"]
     GATE --> CAT
@@ -204,26 +204,23 @@ flowchart LR
 ### 3.1 Flow Matching Loss
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph sample["Sampling"]
         X0["x_0 (docked)"]
         X1["x_1 (crystal)"]
         T["t ~ Uniform(0,1)"]
     end
 
-    INTERP["x_t = (1-t)*x0 + t*x1"]
-    FWD["v_pred = model(prot, lig_t, t)"]
-    VT["v_true = x1 - x0"]
-    MSE["L_flow = MSE(v_pred, v_true)"]
-    DG["L_dg = dist geometry<br/>bond constraints<br/>time-weighted"]
-    TOTAL["L = L_flow + 0.1 * L_dg"]
-
-    X0 --> INTERP
+    X0 --> INTERP["x_t = (1-t)*x0 + t*x1"]
     X1 --> INTERP
     T --> INTERP
-    INTERP --> FWD --> MSE --> TOTAL
-    VT --> MSE
-    DG --> TOTAL
+
+    INTERP --> FWD["v_pred = model(prot, lig_t, t)"]
+    FWD --> MSE["L_flow = MSE(v_pred, v_true)"]
+    VT["v_true = x1 - x0"] --> MSE
+
+    MSE --> TOTAL["L = L_flow + 0.1 * L_dg"]
+    DG["L_dg = dist geometry<br/>bond constraints, time-weighted"] --> TOTAL
 ```
 
 ### 3.2 Training Configuration
@@ -355,8 +352,8 @@ src/utils/
   model_builder.py   Config -> model construction
 
 configs/
-  train_rectified_flow_full.yaml   # v4 config (trained model)
-  train_joint.yaml                 # Joint architecture template
+  train.yaml                       # Cartesian training config
+  train_torsion.yaml               # SE(3) + Torsion training config
 
 train.py             Training loop
 inference.py         Inference script

@@ -81,14 +81,14 @@ pip install -r requirements.txt
 ### Training
 
 ```bash
-python train.py --config configs/train_joint.yaml
+python train.py --config configs/train.yaml
 ```
 
 ### Multi-GPU Training (DDP)
 
 ```bash
 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=8 \
-  train.py --config configs/train_joint.yaml
+  train.py --config configs/train.yaml
 ```
 
 ### Inference
