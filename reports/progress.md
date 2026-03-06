@@ -146,7 +146,7 @@ flowchart LR
 
 - [ ] Success rate <2A 목표: 60%+ (현재 44.6%)
 - [ ] Self-conditioning 효과 ablation
-- [ ] Torsion space decomposition 적용 (SE(3) + Torsion flow matching)
+- [ ] Torsion space decomposition 적용 (utilities exist in ligand_feat.py, not yet integrated)
 - [ ] Multi-step refinement (iterative application)
 - [ ] Larger dataset / cross-dataset generalization
 - [ ] Inference speed optimization (fewer ODE steps)
@@ -167,7 +167,7 @@ flowchart LR
 - Muon + AdamW hybrid optimizer
 - EMA (decay=0.999) for inference
 
-### 2024-11 - SE(3) + Torsion Decomposition
-- Translation [3D] + Rotation [3D] + Torsion [M] 분해 구현
-- 3-10x dimension reduction (e.g., 132D -> 28D)
-- Chain-wise ESM embedding 지원 추가
+### 2024-11 - SE(3) + Torsion Decomposition (not used in training)
+- Translation [3D] + Rotation [3D] + Torsion [M] decomposition utilities implemented
+- Not integrated into model/training - current model uses Cartesian velocity
+- Chain-wise ESM embedding support added
