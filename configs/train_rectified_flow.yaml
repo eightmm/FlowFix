@@ -1,0 +1,102 @@
+# Rectified Flow Test: Stable Linear Interpolation
+data:
+  data_dir: train_data
+  split_file: train_data/splits_overfit_32.json
+  max_train_samples: null
+  max_val_samples: 4
+  fix_pose: true
+  fix_pose_high_rmsd: true
+  position_noise_scale: 0.05
+  num_workers: 4
+  loading_mode: lazy
+  timestep_sampling:
+    method: uniform
+    mu: 0.8
+    sigma: 1.7
+    num_timesteps_per_sample: 1
+
+model:
+  architecture: joint
+  protein_input_scalar_dim: 76
+  protein_input_vector_dim: 31
+  protein_input_edge_scalar_dim: 39
+  protein_input_edge_vector_dim: 8
+  ligand_input_scalar_dim: 122
+  ligand_input_edge_scalar_dim: 44
+  hidden_scalar_dim: 128
+  hidden_vector_dim: 32
+  hidden_edge_dim: 128
+  joint_num_layers: 6
+  cross_edge_distance_cutoff: 6.0
+  cross_edge_max_neighbors: 16
+  cross_edge_num_rbf: 32
+  intra_edge_distance_cutoff: 6.0
+  intra_edge_max_neighbors: 16
+  hidden_dim: 256
+  esm_proj_dim: 128
+  self_conditioning: false
+  dropout: 0.0
+
+training:
+  num_epochs: 300
+  batch_size: 4               # 8 updates per epoch (32/4)
+  val_batch_size: 4
+  gradient_clip: 1.0          # Standard clip is fine for Rectified Flow
+  gradient_accumulation_steps: 1
+  distance_geometry_weight: 0.1
+  ema:
+    enabled: false
+  compile: false
+
+  optimizer:
+    type: muon
+    muon:
+      lr: 0.05
+      momentum: 0.95
+      weight_decay: 0.0
+      min_lr: 0.005
+    adamw:
+      lr: 0.001
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      min_lr: 0.0001
+
+  schedule:
+    warmup_fraction: 0.05
+    plateau_fraction: 0.80
+    decay_fraction: 0.15
+    warmup_epochs: 5
+
+  validation:
+    frequency: 20
+    early_stopping_patience: 1000
+
+sampling:
+  num_steps: 20
+  method: euler
+  schedule: uniform
+  t_end: 1.0
+
+experiment:
+  base_dir: save
+
+checkpoint:
+  save_freq: 20
+  save_latest: true
+  keep_last_n: 3
+
+visualization:
+  enabled: true
+  save_animation: true
+  animation_fps: 10
+  num_samples: 1
+
+wandb:
+  enabled: true
+  project: "protein-ligand-flowfix"
+  name: "rectified-flow-stable"
+  tags: ["overfit-test", "rectified-flow", "stable"]
+  log_gradients: false
+  log_model_weights: false
+  log_animations: true

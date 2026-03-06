@@ -1,0 +1,95 @@
+{
+  "checkpoint": "save/rectified-flow-full-v4/checkpoints/latest.pt",
+  "device": "cuda",
+  "num_steps": 20,
+  "train": {
+    "rows": [
+      {
+        "idx": 0,
+        "pdb_id": "10gs",
+        "initial_rmsd": 3.63333797454834,
+        "final_rmsd": 2.842935562133789,
+        "improvement": 0.7904024124145508
+      },
+      {
+        "idx": 1,
+        "pdb_id": "11gs",
+        "initial_rmsd": 1.846148133277893,
+        "final_rmsd": 1.7554833889007568,
+        "improvement": 0.09066474437713623
+      },
+      {
+        "idx": 2,
+        "pdb_id": "13gs",
+        "initial_rmsd": 1.2353832721710205,
+        "final_rmsd": 1.4732733964920044,
+        "improvement": -0.2378901243209839
+      },
+      {
+        "idx": 3,
+        "pdb_id": "16pk",
+        "initial_rmsd": 2.303230047225952,
+        "final_rmsd": 1.4534145593643188,
+        "improvement": 0.8498154878616333
+      },
+      {
+        "idx": 4,
+        "pdb_id": "184l",
+        "initial_rmsd": 2.53757381439209,
+        "final_rmsd": 2.5515999794006348,
+        "improvement": -0.014026165008544922
+      }
+    ],
+    "summary": {
+      "count": 5,
+      "avg_initial_rmsd": 2.3111346483230593,
+      "avg_final_rmsd": 2.015341377258301,
+      "avg_improvement": 0.2957932710647583
+    }
+  },
+  "valid": {
+    "rows": [
+      {
+        "idx": 0,
+        "pdb_id": "1ckb",
+        "initial_rmsd": 3.267951250076294,
+        "final_rmsd": 2.5414278507232666,
+        "improvement": 0.7265233993530273
+      },
+      {
+        "idx": 1,
+        "pdb_id": "1ckb",
+        "initial_rmsd": 3.251361846923828,
+        "final_rmsd": 2.606574535369873,
+        "improvement": 0.6447873115539551
+      },
+      {
+        "idx": 2,
+        "pdb_id": "1ckb",
+        "initial_rmsd": 3.3592185974121094,
+        "final_rmsd": 5.469128608703613,
+        "improvement": -2.109910011291504
+      },
+      {
+        "idx": 3,
+        "pdb_id": "1ckb",
+        "initial_rmsd": 3.159385919570923,
+        "final_rmsd": 3.1020753383636475,
+        "improvement": 0.05731058120727539
+      },
+      {
+        "idx": 4,
+        "pdb_id": "1ckb",
+        "initial_rmsd": 3.4505856037139893,
+        "final_rmsd": 4.446047306060791,
+        "improvement": -0.9954617023468018
+      }
+    ],
+    "summary": {
+      "count": 5,
+      "avg_initial_rmsd": 3.2977006435394287,
+      "avg_final_rmsd": 3.633050727844238,
+      "avg_improvement": -0.33535008430480956
+    }
+  }
+}

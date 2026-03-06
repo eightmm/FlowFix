@@ -55,6 +55,7 @@ train_data_dg/
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -72,7 +73,6 @@ temp/
 *.cache
 
 # Project specific
-docs/
 .cursorignore
 .kiro/
 FLOWFIX_GUIDE.md
