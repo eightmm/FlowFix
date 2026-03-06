@@ -15,6 +15,8 @@ scripts/
 
 - `visualize_loss.py`: 학습 로그 기반 loss 시각화
 - `visualize_trajectory.py`: 샘플링 trajectory 시각화
+- `infer_full_validation.py`: 전체 validation set 추론
+- `infer_small_train_valid.py`: 소규모 train/valid 추론
 
 ## `scripts/data/`
 
@@ -24,14 +26,11 @@ scripts/
 - `generate_test_data.py`: 테스트 데이터 생성
 - `inspect_data.py`: 데이터 점검
 - `verify_test_data.py`: 테스트 데이터 검증
-- `run_preprocess_pdbbind.sh`: 전처리 실행용 쉘 래퍼
 
 ## `scripts/slurm/`
 
 환경(경로, 파티션, GPU 수)은 클러스터마다 다르므로, 본인 환경에 맞게 `PYTHON`, `PROJECT_DIR`, `#SBATCH ...`를 조정해서 사용하세요.
 
-- `run_train_joint_test.sh`: 단일 GPU 빠른 테스트
-- `run_train_joint.sh`: 멀티 GPU(DDP) 학습
+- `run_train_full.sh`: 멀티 GPU(DDP) 학습
 - `run_inference.sh`: 체크포인트 추론/평가
-- `run_visualize_trajectory.sh`: trajectory 시각화
-
+- `run_full_val_inference.sh`: 전체 validation 추론
